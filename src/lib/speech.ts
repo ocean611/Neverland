@@ -79,6 +79,39 @@ export function setOpenAIBaseUrl(url: string): void {
   localStorage.setItem('neverland_openai_base_url', url.trim() || 'https://api.openai.com/v1');
 }
 
+// Web Speech API TTS fallback — used when OpenAI TTS fetch fails (e.g. Safari network block).
+// Selects the best available voice for the companion, then speaks silently if unavailable.
+function speakWithWebSpeech(text: string, preferredVoice: string, opts: SpeakOptions): void {
+  if (typeof window === 'undefined' || !window.speechSynthesis) {
+    opts.onEnd?.();
+    return;
+  }
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = 'en-US';
+
+  // Try to pick a high-quality system voice matching the companion gender
+  const voices = window.speechSynthesis.getVoices();
+  const isFemale = preferredVoice === 'nova' || preferredVoice === 'shimmer' || preferredVoice === 'alloy';
+  const qualityKeywords = isFemale
+    ? ['Samantha', 'Karen', 'Victoria', 'Moira', 'Tessa']
+    : ['Daniel', 'Alex', 'Fred', 'Tom', 'Oliver'];
+
+  let picked = voices.find(v => qualityKeywords.some(k => v.name.includes(k)) && v.lang.startsWith('en'));
+  if (!picked) picked = voices.find(v => v.lang.startsWith('en-US'));
+  if (picked) utterance.voice = picked;
+
+  utterance.rate  = 0.92;
+  utterance.pitch = isFemale ? 1.05 : 0.9;
+
+  utterance.onstart = () => opts.onStart?.();
+  utterance.onend   = () => opts.onEnd?.();
+  utterance.onerror = () => opts.onEnd?.();
+
+  window.speechSynthesis.cancel(); // stop any prior utterance
+  window.speechSynthesis.speak(utterance);
+}
+
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
   // Stop any current playback and release the previous blob URL
   globalAudio.pause();
@@ -98,14 +131,16 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   try {
     res = await fetch(`${baseUrl}/audio/speech`, {
       method: 'POST',
+      mode: 'cors',
       headers: {
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ model: 'tts-1', input: text, voice, speed: getCompanion() === 'arthur' ? 0.85 : 0.95 }),
     });
-  } catch (e) {
-    opts.onError?.(`Voice network error: ${(e as Error).message}`);
+  } catch {
+    // Network error (e.g. Safari "Load failed") — fall back to Web Speech API silently
+    speakWithWebSpeech(text, voice, opts);
     return;
   }
 
@@ -151,6 +186,8 @@ export interface RecognitionHandlers {
   onResult: (text: string) => void;
   onError: (msg: string) => void;
   onEnd: () => void;
+  /** Called after MediaRecorder.start() fires — safe to show "please speak" UI */
+  onRecordingStarted?: () => void;
 }
 
 // Detect the MIME type Safari actually supports at runtime.
@@ -311,6 +348,8 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
 
       recorder.start(1000);
       console.log('[STT] Recording started');
+      // Notify caller that hardware is confirmed active — safe to show "please speak" UI
+      handlers.onRecordingStarted?.();
     })
     .catch((e: unknown) => {
       console.error('[STT] getUserMedia error', e);

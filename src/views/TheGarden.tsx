@@ -5,7 +5,11 @@ import type { Message } from '../lib/storage';
 import { sendMessage as sendToAI, translateToChineseFallback, getApiKey, getProvider } from '../lib/ai';
 import { speak, stopSpeaking, startListening, sttSupported, unlockAudio } from '../lib/speech';
 
-type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
+// 'starting'  — getUserMedia in-flight; hardware not yet confirmed
+// 'recording' — MediaRecorder.start() confirmed; user should speak
+// 'processing'— Whisper/Web Speech API in-flight
+// 'speaking'  — TTS playing back
+type VoiceState = 'idle' | 'starting' | 'recording' | 'processing' | 'speaking';
 
 interface ChatMessage extends Message {
   isThinking?: boolean;
@@ -17,47 +21,60 @@ let nextId = 100;
 // ─── StardustOrb ──────────────────────────────────────────────────────────────
 
 function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
-  const listening   = state === 'listening';
+  const starting    = state === 'starting';
+  const recording   = state === 'recording';
   const thinking    = state === 'thinking';
   const processing  = state === 'processing';
   const speaking    = state === 'speaking';
-  const active = listening || thinking || processing || speaking;
+  const active = starting || recording || thinking || processing || speaking;
 
-  const coreColor = listening
-    ? 'rgba(96,180,220,0.55)'
+  const coreColor = recording
+    ? 'rgba(220,60,60,0.55)'
+    : starting
+    ? 'rgba(220,160,40,0.50)'
     : thinking
     ? 'rgba(60,200,200,0.45)'
     : processing
-    ? 'rgba(220,160,60,0.45)'
+    ? 'rgba(60,130,220,0.50)'
     : speaking
     ? 'rgba(80,200,140,0.48)'
     : 'rgba(80,140,180,0.32)';
 
-  const glowColor = listening
-    ? 'rgba(96,180,220,0.18)'
+  const glowColor = recording
+    ? 'rgba(220,60,60,0.20)'
+    : starting
+    ? 'rgba(220,160,40,0.16)'
     : thinking
     ? 'rgba(60,200,200,0.14)'
     : processing
-    ? 'rgba(220,160,60,0.14)'
+    ? 'rgba(60,130,220,0.16)'
     : speaking
     ? 'rgba(80,200,140,0.16)'
     : 'rgba(80,140,180,0.10)';
 
-  const borderColor = listening
-    ? 'rgba(148,210,235,0.18)'
+  const borderColor = recording
+    ? 'rgba(240,100,100,0.22)'
+    : starting
+    ? 'rgba(240,190,80,0.20)'
     : thinking
     ? 'rgba(103,232,249,0.15)'
     : processing
-    ? 'rgba(240,180,80,0.18)'
+    ? 'rgba(80,150,240,0.20)'
     : speaking
     ? 'rgba(100,230,160,0.18)'
     : 'rgba(148,210,235,0.08)';
 
-  const ringColor = speaking ? 'rgba(80,200,140,0.22)' : 'rgba(148,210,235,0.22)';
-  const particleColor = listening
-    ? 'rgba(148,210,235,0.7)'
+  const ringColor = recording
+    ? 'rgba(220,60,60,0.22)'
+    : speaking
+    ? 'rgba(80,200,140,0.22)'
+    : 'rgba(148,210,235,0.22)';
+  const particleColor = recording
+    ? 'rgba(240,120,120,0.75)'
+    : starting
+    ? 'rgba(240,190,80,0.70)'
     : processing
-    ? 'rgba(240,180,80,0.65)'
+    ? 'rgba(80,150,240,0.65)'
     : speaking
     ? 'rgba(100,230,160,0.7)'
     : 'rgba(148,210,235,0.35)';
@@ -76,16 +93,16 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
         className="absolute rounded-full"
         style={{
           width: 134, height: 134,
-          background: `radial-gradient(circle, ${listening ? 'rgba(96,180,220,0.22)' : thinking ? 'rgba(60,200,200,0.18)' : processing ? 'rgba(220,160,60,0.18)' : speaking ? 'rgba(80,200,140,0.20)' : 'rgba(80,140,180,0.12)'} 0%, transparent 65%)`,
+          background: `radial-gradient(circle, ${recording ? 'rgba(220,60,60,0.22)' : starting ? 'rgba(220,160,40,0.20)' : thinking ? 'rgba(60,200,200,0.18)' : processing ? 'rgba(60,130,220,0.18)' : speaking ? 'rgba(80,200,140,0.20)' : 'rgba(80,140,180,0.12)'} 0%, transparent 65%)`,
           border: `1px solid ${borderColor}`,
         }}
         animate={{ scale: [1, 1.08, 1], opacity: [0.6, 1, 0.6] }}
         transition={{ duration: active ? 2.2 : 4, repeat: Infinity, ease: 'easeInOut', delay: 0.3 }}
       />
 
-      {/* Ripple rings — listening */}
+      {/* Ripple rings — recording (red) */}
       <AnimatePresence>
-        {listening && [0, 0.55, 1.1].map((delay) => (
+        {recording && [0, 0.55, 1.1].map((delay) => (
           <motion.div
             key={delay}
             className="absolute rounded-full"
@@ -127,12 +144,26 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
         )}
       </AnimatePresence>
 
-      {/* Processing spinner (Whisper transcribing) */}
+      {/* Starting spinner — yellow, waiting for mic permission */}
+      <AnimatePresence>
+        {starting && (
+          <motion.div
+            className="absolute rounded-full"
+            style={{ width: 100, height: 100, border: '1.5px solid transparent', borderTopColor: 'rgba(240,190,60,0.65)', borderRightColor: 'rgba(240,190,60,0.20)' }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1, rotate: 360 }}
+            exit={{ opacity: 0 }}
+            transition={{ rotate: { duration: 1.2, repeat: Infinity, ease: 'linear' }, opacity: { duration: 0.3 } }}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Processing spinner — blue, Whisper/Web Speech in-flight */}
       <AnimatePresence>
         {processing && (
           <motion.div
             className="absolute rounded-full"
-            style={{ width: 100, height: 100, border: '1.5px solid transparent', borderTopColor: 'rgba(240,180,80,0.55)', borderRightColor: 'rgba(240,180,80,0.15)' }}
+            style={{ width: 100, height: 100, border: '1.5px solid transparent', borderTopColor: 'rgba(80,150,240,0.65)', borderRightColor: 'rgba(80,150,240,0.18)' }}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1, rotate: 360 }}
             exit={{ opacity: 0 }}
@@ -168,7 +199,7 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
         style={{
           width: 78, height: 78,
           background: `radial-gradient(circle at 38% 35%, rgba(255,255,255,0.12) 0%, ${coreColor} 40%, rgba(10,30,50,0.6) 100%)`,
-          boxShadow: `0 0 30px ${listening ? 'rgba(96,180,220,0.35)' : thinking ? 'rgba(60,200,200,0.3)' : speaking ? 'rgba(80,200,140,0.32)' : 'rgba(80,140,180,0.2)'}, inset 0 0 20px rgba(255,255,255,0.06)`,
+          boxShadow: `0 0 30px ${recording ? 'rgba(220,60,60,0.35)' : starting ? 'rgba(220,160,40,0.30)' : thinking ? 'rgba(60,200,200,0.3)' : processing ? 'rgba(60,130,220,0.32)' : speaking ? 'rgba(80,200,140,0.32)' : 'rgba(80,140,180,0.2)'}, inset 0 0 20px rgba(255,255,255,0.06)`,
           border: '1px solid rgba(255,255,255,0.12)',
         }}
         animate={{ scale: [1, active ? 1.08 : 1.06, 1] }}
@@ -490,22 +521,28 @@ export default function TheGarden({ onSave }: Props) {
   // ─── STT helpers ────────────────────────────────────────────────────────────
 
   const toggleListening = () => {
-    if (voiceState === 'listening') {
-      // User tapped to stop — trigger MediaRecorder stop → Whisper
+    // recording → stop recording → processing
+    if (voiceState === 'recording') {
       stopRecRef.current?.();
       stopRecRef.current = null;
       setVoiceState('processing');
       return;
     }
-    if (voiceState === 'processing') return; // already waiting for Whisper
-    // Unlock Safari audio context synchronously within this gesture
+    // Guard: can't start a new session while another is in flight
+    if (voiceState === 'starting' || voiceState === 'processing') return;
+
+    // Unlock Safari audio context synchronously within this user gesture
     unlockAudio();
-    // Stop any ongoing TTS first
     stopSpeakingNow();
 
-    setVoiceState('listening');
+    // idle / speaking → starting (yellow spinner — waiting for getUserMedia)
+    setVoiceState('starting');
     const capturedImage = selectedImage;
     const stop = startListening({
+      // Fired after MediaRecorder.start() — hardware confirmed; safe to prompt user
+      onRecordingStarted: () => {
+        setVoiceState('recording');
+      },
       onResult: (text) => {
         stopRecRef.current = null;
         setVoiceState('idle');
@@ -612,10 +649,13 @@ export default function TheGarden({ onSave }: Props) {
     .map(({ id, role, text, english, chinese, imageDataUrl }) => ({ id, role, text, english, chinese, imageDataUrl }));
 
   const orbState: VoiceState | 'thinking' = isThinking ? 'thinking' : voiceState;
+  const micActive = voiceState === 'starting' || voiceState === 'recording';
   const orbLabel = isThinking
     ? 'Thinking…'
-    : voiceState === 'listening'
-    ? 'Listening…'
+    : voiceState === 'starting'
+    ? 'Starting mic…'
+    : voiceState === 'recording'
+    ? '请说话…'
     : voiceState === 'processing'
     ? 'Transcribing…'
     : voiceState === 'speaking'
@@ -660,10 +700,10 @@ export default function TheGarden({ onSave }: Props) {
 
           <div className="z-10 h-8 flex items-center justify-center mt-3">
             <AnimatePresence mode="wait">
-              {voiceState === 'listening' && !isThinking ? (
-                <Waveform key="wave-listen" color="rgba(148,210,235,0.6)" />
+              {voiceState === 'recording' && !isThinking ? (
+                <Waveform key="wave-rec" color="rgba(240,100,100,0.7)" />
               ) : voiceState === 'processing' && !isThinking ? (
-                <Waveform key="wave-process" color="rgba(240,180,80,0.6)" />
+                <Waveform key="wave-process" color="rgba(80,150,240,0.65)" />
               ) : voiceState === 'speaking' && !isThinking ? (
                 <Waveform key="wave-speak" color="rgba(80,200,140,0.6)" />
               ) : (
@@ -815,30 +855,49 @@ export default function TheGarden({ onSave }: Props) {
             );
           })()}
 
-          {/* Mic button */}
+          {/* Mic button — 4 visual states: idle(blue) starting(yellow) recording(red) processing(blue spinner) */}
           <motion.button
             onClick={toggleListening}
-            disabled={isThinking || !sttSupported || voiceState === 'processing'}
+            disabled={isThinking || !sttSupported || voiceState === 'starting' || voiceState === 'processing'}
             className="relative flex-shrink-0 flex items-center justify-center w-12 h-12 rounded-full"
             style={{
-              background: voiceState === 'listening'
-                ? 'radial-gradient(circle at center, rgba(220,50,60,0.5) 0%, rgba(160,30,40,0.6) 100%)'
+              background: voiceState === 'recording'
+                ? 'radial-gradient(circle at center, rgba(220,50,60,0.55) 0%, rgba(160,30,40,0.65) 100%)'
+                : voiceState === 'starting'
+                ? 'radial-gradient(circle at center, rgba(220,160,40,0.50) 0%, rgba(150,100,20,0.55) 100%)'
                 : voiceState === 'processing'
-                ? 'radial-gradient(circle at center, rgba(200,140,40,0.4) 0%, rgba(140,90,20,0.5) 100%)'
+                ? 'radial-gradient(circle at center, rgba(50,120,220,0.45) 0%, rgba(30,70,160,0.55) 100%)'
                 : 'radial-gradient(circle at center, rgba(96,180,220,0.3) 0%, rgba(40,100,150,0.4) 100%)',
-              border: `1.5px solid ${voiceState === 'listening' ? 'rgba(240,80,90,0.4)' : voiceState === 'processing' ? 'rgba(240,180,60,0.35)' : 'rgba(148,210,235,0.25)'}`,
-              boxShadow: voiceState === 'listening' ? '0 0 20px rgba(220,50,60,0.35)' : voiceState === 'processing' ? '0 0 14px rgba(220,160,50,0.25)' : '0 0 12px rgba(96,180,220,0.18)',
+              border: `1.5px solid ${
+                voiceState === 'recording' ? 'rgba(240,80,90,0.45)'
+                : voiceState === 'starting' ? 'rgba(240,190,60,0.40)'
+                : voiceState === 'processing' ? 'rgba(80,150,240,0.40)'
+                : 'rgba(148,210,235,0.25)'
+              }`,
+              boxShadow: voiceState === 'recording'
+                ? '0 0 22px rgba(220,50,60,0.40)'
+                : voiceState === 'starting'
+                ? '0 0 16px rgba(220,160,40,0.32)'
+                : voiceState === 'processing'
+                ? '0 0 16px rgba(60,130,220,0.30)'
+                : '0 0 12px rgba(96,180,220,0.18)',
               backdropFilter: 'blur(12px)',
               WebkitBackdropFilter: 'blur(12px)',
               opacity: (isThinking || !sttSupported) ? 0.45 : 1,
             }}
-            whileTap={!isThinking && sttSupported && voiceState !== 'processing' ? { scale: 0.9 } : {}}
-            animate={voiceState === 'listening' ? { scale: [1, 1.05, 1] } : { scale: 1 }}
-            transition={voiceState === 'listening' ? { duration: 1.8, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
-            aria-label={voiceState === 'listening' ? 'Stop recording' : voiceState === 'processing' ? 'Transcribing…' : 'Start recording'}
+            whileTap={!isThinking && sttSupported && !micActive && voiceState !== 'processing' ? { scale: 0.9 } : {}}
+            animate={voiceState === 'recording' ? { scale: [1, 1.05, 1] } : { scale: 1 }}
+            transition={voiceState === 'recording' ? { duration: 1.8, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
+            aria-label={
+              voiceState === 'recording' ? 'Stop recording'
+              : voiceState === 'starting' ? 'Starting mic…'
+              : voiceState === 'processing' ? 'Transcribing…'
+              : 'Start recording'
+            }
           >
+            {/* Red ripple ring while recording */}
             <AnimatePresence>
-              {voiceState === 'listening' && (
+              {voiceState === 'recording' && (
                 <motion.div
                   className="absolute inset-0 rounded-full border border-red-400/30"
                   initial={{ scale: 1, opacity: 0.6 }}
@@ -848,10 +907,13 @@ export default function TheGarden({ onSave }: Props) {
                 />
               )}
             </AnimatePresence>
-            {voiceState === 'listening'
+
+            {voiceState === 'recording'
               ? <MicOff size={19} style={{ color: 'rgba(255,180,180,0.9)' }} />
+              : voiceState === 'starting'
+              ? <motion.div className="w-4 h-4 rounded-full border-2" style={{ borderColor: 'rgba(240,190,60,0.65)', borderTopColor: 'transparent' }} animate={{ rotate: 360 }} transition={{ duration: 0.9, repeat: Infinity, ease: 'linear' }} />
               : voiceState === 'processing'
-              ? <motion.div className="w-4 h-4 rounded-full border-2 border-t-transparent" style={{ borderColor: 'rgba(240,180,80,0.6)', borderTopColor: 'transparent' }} animate={{ rotate: 360 }} transition={{ duration: 0.9, repeat: Infinity, ease: 'linear' }} />
+              ? <motion.div className="w-4 h-4 rounded-full border-2" style={{ borderColor: 'rgba(80,150,240,0.65)', borderTopColor: 'transparent' }} animate={{ rotate: 360 }} transition={{ duration: 0.9, repeat: Infinity, ease: 'linear' }} />
               : <Mic size={19} style={{ color: 'rgba(148,210,235,0.85)' }} />
             }
           </motion.button>
