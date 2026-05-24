@@ -79,11 +79,19 @@ export function setOpenAIBaseUrl(url: string): void {
   localStorage.setItem('neverland_openai_base_url', url.trim() || 'https://api.openai.com/v1');
 }
 
+const TTS_CJK_REGEX = /[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/;
+
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
   // Stop any current playback and release the previous blob URL
   globalAudio.pause();
   globalAudio.src = '';
   revokeActive();
+
+  // Hard gate: never send CJK text to the English TTS voice engine.
+  if (!text || !text.trim() || TTS_CJK_REGEX.test(text)) {
+    opts.onEnd?.();
+    return;
+  }
 
   const key = getOpenAIKey();
   if (!key) {

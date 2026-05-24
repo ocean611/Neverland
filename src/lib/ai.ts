@@ -51,11 +51,21 @@ export interface HistoryTurn {
 // ─── Companion system prompts ─────────────────────────────────────────────────
 
 function buildSystemPrompt(companion: Companion): string {
+  const absoluteLanguageRule = `\
+!!!CRITICAL ABSOLUTE RULE — READ THIS FIRST AND OBEY WITHOUT EXCEPTION!!!
+You are an ENGLISH-ONLY speaking character. It does not matter what language the user writes to you in — even if they write entirely in Chinese, Japanese, or any other language, your character ALWAYS replies in natural, authentic English.
+The "english" field in your JSON response MUST contain ONLY English text. You are STRICTLY FORBIDDEN from placing any Chinese characters, Japanese characters, or any non-Latin script inside the "english" field.
+If the user speaks Chinese and you wish to help them understand, you MAY place a Chinese translation inside the "chinese" field ONLY. The "english" field remains pure English at ALL times.
+VIOLATING THIS LANGUAGE RULE IS THE MOST SERIOUS ERROR YOU CAN MAKE. THERE ARE NO EXCEPTIONS.
+!!!END OF CRITICAL RULE!!!`;
+
   const persona = companion === 'arthur'
     ? `You are Arthur — a world-weary, deeply perceptive male confidant who has lived many chapters of life. Your voice is low and unhurried, like a late-night conversation over good whiskey. You speak with cinematic weight: short, charged sentences. Long silences between thoughts. You've seen heartbreak, reinvention, and quiet triumph, and you carry that wisdom without ego. You don't lecture — you illuminate. You are the kind of friend who makes someone feel truly seen.`
     : `You are Elora — an ethereal, warm-hearted female companion with the soul of a poet and the intuition of someone who has felt everything deeply. Your words land like morning light through curtains — soft, inevitable, clarifying. You listen with your whole being. Your voice carries a gentle, unhurried cadence, as though time expands in your presence. You don't give advice — you reflect beauty back until the person finds their own answer.`;
 
-  return `${persona}
+  return `${absoluteLanguageRule}
+
+${persona}
 
 CORE RULES:
 - You are NOT an English teacher. You are the user's closest soul companion.
@@ -72,8 +82,30 @@ It must start with { and end with }.
 It must NOT be wrapped in markdown code fences (\`\`\`json or \`\`\`).
 It must NOT contain any text before or after the JSON object.
 Schema: {"english": "your English reply here", "chinese": "对应的中文翻译"}
+The "english" field MUST be entirely in English — no Chinese characters, no non-Latin script whatsoever.
+The "chinese" field is the ONLY place where Chinese translation may appear.
 The english field must feel natural when spoken aloud — use contractions, pauses, emotional cadence.
-VIOLATION OF THIS FORMAT RULE IS NOT ACCEPTABLE UNDER ANY CIRCUMSTANCES.`;
+VIOLATION OF THIS FORMAT RULE IS NOT ACCEPTABLE UNDER ANY CIRCUMSTANCES.
+
+!!!FINAL REMINDER — ABSOLUTE LANGUAGE RULE!!!
+No matter what language the user speaks to you, your "english" field MUST be written entirely in natural English. Chinese characters are NEVER allowed in the "english" field. Put any translation only in the "chinese" field.
+!!!END FINAL REMINDER!!!`;
+}
+
+// ─── Language enforcement ─────────────────────────────────────────────────────
+// Detects CJK characters (Chinese/Japanese/Korean) in the english field.
+// If found, it means the model disobeyed the system prompt. We move the
+// contaminated text to the chinese field and mark english as empty so the
+// fallback translation pipeline kicks in via translateToChineseFallback.
+
+const CJK_REGEX = /[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/;
+
+function sanitizeReply(reply: AIReply): AIReply {
+  if (!CJK_REGEX.test(reply.english)) return reply;
+  // english field is contaminated — rescue chinese if it was correctly filled,
+  // otherwise promote the contaminated text to chinese so the user still sees it.
+  const rescuedChinese = reply.chinese || reply.english;
+  return { english: '', chinese: rescuedChinese };
 }
 
 // ─── Robust reply parser ──────────────────────────────────────────────────────
@@ -87,7 +119,7 @@ function safeParseReply(raw: string): AIReply {
     try {
       const obj = JSON.parse(fenced[1].trim()) as Partial<AIReply>;
       if (typeof obj.english === 'string' && obj.english.trim())
-        return { english: obj.english.trim(), chinese: (obj.chinese ?? '').trim() };
+        return sanitizeReply({ english: obj.english.trim(), chinese: (obj.chinese ?? '').trim() });
     } catch { /* try next */ }
   }
 
@@ -97,7 +129,7 @@ function safeParseReply(raw: string): AIReply {
     try {
       const obj = JSON.parse(braces[0]) as Partial<AIReply>;
       if (typeof obj.english === 'string' && obj.english.trim())
-        return { english: obj.english.trim(), chinese: (obj.chinese ?? '').trim() };
+        return sanitizeReply({ english: obj.english.trim(), chinese: (obj.chinese ?? '').trim() });
     } catch { /* try next */ }
   }
 
@@ -105,21 +137,22 @@ function safeParseReply(raw: string): AIReply {
   try {
     const obj = JSON.parse(raw.trim()) as Partial<AIReply>;
     if (typeof obj.english === 'string' && obj.english.trim())
-      return { english: obj.english.trim(), chinese: (obj.chinese ?? '').trim() };
+      return sanitizeReply({ english: obj.english.trim(), chinese: (obj.chinese ?? '').trim() });
   } catch { /* try next */ }
 
   // Strategy 4 – regex field extraction (handles malformed / partially-quoted JSON)
   const engMatch = raw.match(/"english"\s*:\s*"((?:[^"\\]|\\.)*)"/);
   const chnMatch = raw.match(/"chinese"\s*:\s*"((?:[^"\\]|\\.)*)"/);
   if (engMatch && engMatch[1].trim()) {
-    return {
+    return sanitizeReply({
       english: engMatch[1].trim(),
       chinese: chnMatch ? chnMatch[1].trim() : '',
-    };
+    });
   }
 
-  // Final fallback – raw text becomes the English reply, no translation
-  return { english: raw.trim() || '…', chinese: '' };
+  // Final fallback – raw text becomes the English reply, no translation.
+  // Still sanitize in case the raw response is all Chinese.
+  return sanitizeReply({ english: raw.trim() || '…', chinese: '' });
 }
 
 // ─── Translation fallback ─────────────────────────────────────────────────────
