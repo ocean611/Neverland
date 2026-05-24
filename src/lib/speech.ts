@@ -42,16 +42,28 @@ export function unlockAudio(): void {
 
 export const sttSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 
-// ─── Stop playback ────────────────────────────────────────────────────────────
+// ─── Force-stop all audio (API player + synthesis queue) ─────────────────────
+// Call this before starting any new audio and at the top of every user-gesture
+// handler that triggers audio (send button, mic button). Guarantees a clean
+// slate so old synthesis utterances can never bleed into the next playback.
 
 let pendingBgmRestore: (() => void) | null = null;
 
-export function stopSpeaking(): void {
+export function stopAllAudio(): void {
+  // Cut the API audio player
   globalAudio.pause();
+  globalAudio.currentTime = 0;
   globalAudio.src = '';
   revokeActive();
+  // Flush every queued and in-progress utterance from the synthesis engine
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
   if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
 }
+
+// Keep the old name exported as an alias so nothing else breaks.
+export const stopSpeaking = stopAllAudio;
 
 // ─── TTS public API ───────────────────────────────────────────────────────────
 
@@ -82,6 +94,7 @@ function speakNative(text: string, opts: SpeakOptions): void {
     opts.onEnd?.();
     return;
   }
+  // Always cancel before queuing — prevents stale utterances from replaying.
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = 'en-US';
@@ -92,11 +105,8 @@ function speakNative(text: string, opts: SpeakOptions): void {
 }
 
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
-  // Stop any ongoing playback first
-  globalAudio.pause();
-  globalAudio.src = '';
-  revokeActive();
-  if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
+  // Silence everything — API audio AND any queued synthesis utterances.
+  stopAllAudio();
 
   const key = getOpenAIKey();
   if (!key) {
