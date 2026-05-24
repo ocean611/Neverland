@@ -8,14 +8,13 @@ const VOICES: Record<Companion, string> = {
   elora:  'nova',
 };
 
-// ─── Global audio singleton ───────────────────────────────────────────────────
-// Created once at module load — never re-created. This is the only element
-// that ever plays TTS audio. Safari's autoplay unlock is bound to a specific
-// Audio object; reusing this single instance keeps the unlock alive all session.
+// ─── Single global Audio element ─────────────────────────────────────────────
+// One persistent instance reused for every playback. Safari requires the audio
+// context to be unlocked by a synchronous user gesture; reusing the same element
+// keeps that unlock active for the entire session.
 
 const globalAudio = new Audio();
-
-const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+globalAudio.preload = 'none';
 
 let activeObjectUrl: string | null = null;
 
@@ -26,46 +25,39 @@ function revokeActive(): void {
   }
 }
 
-// ─── Sync unlock ──────────────────────────────────────────────────────────────
-// MUST be called at the very top of any synchronous user-gesture handler,
-// before any await. Plays a silent clip on globalAudio so Safari registers
-// this object as "user-activated". All future .play() calls on the same
-// object — even after async fetches — are then permitted.
+// ─── Safari audio unlock ──────────────────────────────────────────────────────
+// Call this inside any synchronous user-gesture handler (onClick, onPointerDown).
+// Playing a silent clip on the SAME Audio element we use for real playback is
+// the most reliable unlock strategy across all iOS Safari versions.
+
+const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+let audioUnlocked = false;
 
 export function unlockAudio(): void {
+  if (audioUnlocked) return;
   globalAudio.src = SILENT_WAV;
-  globalAudio.play().catch(() => {});
-  globalAudio.pause();
+  globalAudio.volume = 0;
+  globalAudio.play()
+    .then(() => { audioUnlocked = true; globalAudio.volume = 1; })
+    .catch(() => { /* will retry on next gesture */ });
 }
 
 // ─── STT feature detection ────────────────────────────────────────────────────
 
 export const sttSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 
-// ─── Force-stop all audio (API player + synthesis queue) ─────────────────────
-// Call this before starting any new audio and at the top of every user-gesture
-// handler that triggers audio (send button, mic button). Guarantees a clean
-// slate so old synthesis utterances can never bleed into the next playback.
+// ─── Stop playback ────────────────────────────────────────────────────────────
 
 let pendingBgmRestore: (() => void) | null = null;
 
-export function stopAllAudio(): void {
-  // Cut the API audio player
+export function stopSpeaking(): void {
   globalAudio.pause();
-  globalAudio.currentTime = 0;
   globalAudio.src = '';
   revokeActive();
-  // Flush every queued and in-progress utterance from the synthesis engine
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
-  }
   if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
 }
 
-// Keep the old name exported as an alias so nothing else breaks.
-export const stopSpeaking = stopAllAudio;
-
-// ─── TTS public API ───────────────────────────────────────────────────────────
+// ─── TTS via OpenAI ───────────────────────────────────────────────────────────
 
 export interface SpeakOptions {
   onStart?: () => void;
@@ -87,26 +79,11 @@ export function setOpenAIBaseUrl(url: string): void {
   localStorage.setItem('neverland_openai_base_url', url.trim() || 'https://api.openai.com/v1');
 }
 
-// Native speech synthesis — last-resort fallback when fetch or play() fails.
-function speakNative(text: string, opts: SpeakOptions): void {
-  if (!window.speechSynthesis) {
-    opts.onError?.('Audio unavailable and speech synthesis not supported.');
-    opts.onEnd?.();
-    return;
-  }
-  // Always cancel before queuing — prevents stale utterances from replaying.
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'en-US';
-  utterance.onstart = () => opts.onStart?.();
-  utterance.onend   = () => opts.onEnd?.();
-  utterance.onerror = () => { opts.onError?.('Speech synthesis failed.'); opts.onEnd?.(); };
-  window.speechSynthesis.speak(utterance);
-}
-
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
-  // Silence everything — API audio AND any queued synthesis utterances.
-  stopAllAudio();
+  // Stop any current playback and release the previous blob URL
+  globalAudio.pause();
+  globalAudio.src = '';
+  revokeActive();
 
   const key = getOpenAIKey();
   if (!key) {
@@ -117,78 +94,58 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   const baseUrl = getOpenAIBaseUrl().replace(/\/$/, '');
   const voice   = VOICES[getCompanion()];
 
+  let res: Response;
   try {
-    // ── Fetch audio from OpenAI ──────────────────────────────────────────────
-    const response = await fetch(`${baseUrl}/audio/speech`, {
+    res = await fetch(`${baseUrl}/audio/speech`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: 'tts-1',
-        input: text,
-        voice,
-        speed: getCompanion() === 'arthur' ? 0.85 : 0.95,
-      }),
+      body: JSON.stringify({ model: 'tts-1', input: text, voice, speed: getCompanion() === 'arthur' ? 0.85 : 0.95 }),
     });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`OpenAI TTS ${response.status}: ${body.slice(0, 120)}`);
-    }
-
-    // ── Blob → ObjectURL ────────────────────────────────────────────────────
-    const blob     = await response.blob();
-    const audioUrl = URL.createObjectURL(blob);
-    activeObjectUrl = audioUrl;
-
-    // ── Duck BGM ─────────────────────────────────────────────────────────────
-    const restoreBgm = duckBgm(0.22);
-    pendingBgmRestore = restoreBgm;
-
-    // ── Wire up events then assign src ────────────────────────────────────────
-    globalAudio.onplay  = () => opts.onStart?.();
-    globalAudio.onended = () => {
-      URL.revokeObjectURL(audioUrl);
-      activeObjectUrl = null;
-      restoreBgm();
-      pendingBgmRestore = null;
-      opts.onEnd?.();
-    };
-    globalAudio.onerror = () => {
-      URL.revokeObjectURL(audioUrl);
-      activeObjectUrl = null;
-      restoreBgm();
-      pendingBgmRestore = null;
-      // Blob failed to decode — fall through to native synthesis
-      speakNative(text, opts);
-    };
-
-    globalAudio.src = audioUrl;
-
-    // ── Play on the already-unlocked singleton ────────────────────────────────
-    await globalAudio.play();
-
-  } catch (err: unknown) {
-    // Covers: fetch network error, non-ok API response, NotAllowedError from play()
-    revokeActive();
-    if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
-
-    const isDomEx = err instanceof DOMException;
-    if (isDomEx && (err as DOMException).name === 'NotAllowedError') {
-      // Autoplay still blocked — silent fallback, no error toast
-      speakNative(text, { onStart: opts.onStart, onEnd: opts.onEnd });
-    } else {
-      // Real error (network, API key, etc.) — show message then fallback
-      const msg = err instanceof Error ? err.message : String(err);
-      opts.onError?.(msg);
-      speakNative(text, opts);
-    }
+  } catch (e) {
+    opts.onError?.(`Voice network error: ${(e as Error).message}`);
+    return;
   }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    opts.onError?.(`OpenAI TTS ${res.status}: ${body.slice(0, 120)}`);
+    return;
+  }
+
+  // Convert stream to blob → ObjectURL → assign to the already-unlocked global element
+  const blob = await res.blob();
+  const url  = URL.createObjectURL(blob);
+  activeObjectUrl = url;
+
+  // Duck BGM while TTS is playing; restore when done or stopped
+  const restoreBgm = duckBgm(0.22);
+  pendingBgmRestore = restoreBgm;
+
+  globalAudio.onplay  = () => opts.onStart?.();
+  globalAudio.onended = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
+  globalAudio.onerror = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
+  globalAudio.volume  = 1;
+  globalAudio.src     = url;
+
+  globalAudio.play().catch((e: unknown) => {
+    const name = e instanceof DOMException ? e.name : '';
+    if (name === 'NotAllowedError') {
+      opts.onError?.('Tap anywhere first to enable audio, then press the speaker button again.');
+    } else {
+      opts.onError?.(`Playback failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    revokeActive();
+    opts.onEnd?.();
+  });
 }
 
-// ─── STT via MediaRecorder → Whisper (with Web Speech API fallback) ──────────
+// ─── STT via MediaRecorder → Whisper ─────────────────────────────────────────
+// Uses the standard MediaRecorder API (works on Safari 16+, all modern browsers).
+// On stop, the accumulated audio chunks are sent to the Whisper transcription
+// endpoint using the same OpenAI key/base-URL stored for TTS.
 
 export interface RecognitionHandlers {
   onResult: (text: string) => void;
@@ -196,42 +153,30 @@ export interface RecognitionHandlers {
   onEnd: () => void;
 }
 
-function detectMime(): { mimeType: string; extension: string } {
-  if (typeof MediaRecorder === 'undefined') return { mimeType: 'audio/mp4', extension: 'm4a' };
-  if (MediaRecorder.isTypeSupported('audio/webm')) return { mimeType: 'audio/webm', extension: 'webm' };
-  if (MediaRecorder.isTypeSupported('audio/mp4'))  return { mimeType: 'audio/mp4',  extension: 'm4a'  };
-  if (MediaRecorder.isTypeSupported('audio/ogg'))  return { mimeType: 'audio/ogg',  extension: 'ogg'  };
-  return { mimeType: '', extension: 'webm' };
+// Pick the best supported MIME type for the current browser.
+// Safari only supports audio/mp4; Chrome/Firefox prefer audio/webm.
+// We try webm first (better Whisper compatibility), fall back to mp4.
+function bestMimeType(): string {
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+  ];
+  for (const t of candidates) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
 }
 
-function fallbackWebSpeech(handlers: RecognitionHandlers): boolean {
-  const SR =
-    (window as unknown as { SpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition ??
-    (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition;
-  if (!SR) return false;
-
-  console.log('[STT] Falling back to Web Speech API');
-  const rec = new SR();
-  rec.lang = navigator.language || 'zh-CN';
-  rec.interimResults = false;
-  rec.maxAlternatives = 1;
-
-  rec.onresult = (e: SpeechRecognitionEvent) => {
-    const text = e.results[0]?.[0]?.transcript?.trim() ?? '';
-    if (text) {
-      handlers.onResult(text);
-    } else {
-      handlers.onError('未能识别到语音内容，请再试一次。');
-      handlers.onEnd();
-    }
-  };
-  rec.onerror = () => {
-    handlers.onError('语音识别请求失败，请检查网络和 API Key。');
-    handlers.onEnd();
-  };
-  rec.onend = () => {};
-
-  try { rec.start(); return true; } catch { return false; }
+// Map MIME type to a Whisper-accepted filename (no subdirectory, explicit extension).
+// Safari records audio/mp4 → speech.m4a; Chrome records audio/webm → speech.webm.
+// The filename suffix is what matters — servers use it to detect codec, not the MIME header.
+function mimeToFilename(mime: string): string {
+  if (mime.startsWith('audio/webm')) return 'speech.webm';
+  if (mime.startsWith('audio/ogg'))  return 'speech.ogg';
+  if (mime.startsWith('audio/mp4'))  return 'speech.m4a';
+  return 'speech.webm';
 }
 
 export function startListening(handlers: RecognitionHandlers): (() => void) | null {
@@ -247,7 +192,7 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
   }
 
   const baseUrl = getOpenAIBaseUrl().replace(/\/$/, '');
-  const { mimeType: preferredMime, extension } = detectMime();
+  const preferredMime = bestMimeType();
   const chunks: BlobPart[] = [];
   let recorder: MediaRecorder | null = null;
   let stream:   MediaStream   | null = null;
@@ -258,9 +203,11 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       if (stopped) { s.getTracks().forEach(t => t.stop()); return; }
       stream = s;
 
+      // Create recorder — try preferred MIME, fall back to browser default
       try {
         recorder = new MediaRecorder(s, preferredMime ? { mimeType: preferredMime } : {});
       } catch {
+        // Safari may throw if mimeType isn't supported despite isTypeSupported returning true
         recorder = new MediaRecorder(s);
       }
 
@@ -271,6 +218,7 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       };
 
       recorder.onstop = async () => {
+        // Stop mic tracks AFTER onstop fires so the final chunk is fully written
         stream?.getTracks().forEach(t => t.stop());
 
         const totalSize = chunks.reduce((n, c) => n + (c instanceof Blob ? c.size : 0), 0);
@@ -282,29 +230,36 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
           return;
         }
 
-        const actualMime = recorder!.mimeType || preferredMime || 'audio/mp4';
-        const actualExt  = actualMime.includes('webm') ? 'webm' : actualMime.includes('ogg') ? 'ogg' : extension;
+        const actualMime = recorder!.mimeType || preferredMime || 'audio/webm';
         const blob       = new Blob(chunks, { type: actualMime });
+        const filename   = mimeToFilename(actualMime);
 
+        console.log(`[STT] Sending blob: ${blob.size} bytes, type=${blob.type}, filename=${filename}`);
+
+        // Guard: reject empty blob before hitting the network (Safari can produce these)
         if (blob.size === 0) {
           handlers.onError('未检测到声音，请检查麦克风权限或重试。');
           handlers.onEnd();
           return;
         }
 
-        const file = new File([blob], `speech.${actualExt}`, { type: actualMime });
-        console.log(`[STT] Uploading File: ${file.size} bytes, name=${file.name}`);
-
         const form = new FormData();
-        form.append('file', file);
+        // Explicit filename with extension is required — Safari's server rejects
+        // blobs without a suffix because it cannot infer the codec from MIME alone.
+        // Do NOT set Content-Type header — let the browser add the multipart boundary.
+        form.append('file', blob, filename);
         form.append('model', 'whisper-1');
 
+        // Build the transcription URL from stored base URL, handling any trailing slash
         const whisperUrl = `${baseUrl}/audio/transcriptions`.replace(/([^:])\/\/+/g, '$1/');
 
         try {
           const res = await fetch(whisperUrl, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${key}` },
+            headers: {
+              Authorization: `Bearer ${key}`,
+              // Content-Type intentionally omitted — browser sets it with the FormData boundary
+            },
             body: form,
           });
 
@@ -327,12 +282,10 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
             handlers.onEnd();
           }
         } catch (e) {
-          console.warn('[STT] Whisper fetch failed, trying Web Speech API fallback:', e);
-          if (!fallbackWebSpeech(handlers)) {
-            const msg = e instanceof Error ? e.message : String(e);
-            handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
-            handlers.onEnd();
-          }
+          console.error('[STT] fetch error:', e);
+          const msg = e instanceof Error ? e.message : String(e);
+          handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
+          handlers.onEnd();
         }
       };
 
@@ -343,6 +296,7 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
         handlers.onEnd();
       };
 
+      // Use 1000ms chunks — Safari flushes more reliably at longer intervals
       recorder.start(1000);
       console.log('[STT] Recording started');
     })
@@ -359,11 +313,14 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       handlers.onEnd();
     });
 
+  // Called when user taps mic again — triggers recorder.onstop which sends to Whisper
   return () => {
     stopped = true;
     if (recorder && recorder.state === 'recording') {
+      // requestData flushes any buffered audio before stop fires onstop
       try { recorder.requestData(); } catch { /* ignore */ }
       try { recorder.stop(); } catch { /* ignore */ }
+      // Tracks are stopped inside onstop, not here, to avoid losing the final chunk
     } else {
       stream?.getTracks().forEach(t => t.stop());
     }

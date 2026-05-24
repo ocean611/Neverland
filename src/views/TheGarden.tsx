@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Mic, MicOff, Image, Send, BookmarkPlus, Check, AlertCircle, Volume2, VolumeX, RotateCcw, X } from 'lucide-react';
 import type { Message } from '../lib/storage';
 import { sendMessage as sendToAI, translateToChineseFallback, getApiKey, getProvider } from '../lib/ai';
-import { speak, stopSpeaking, stopAllAudio, startListening, sttSupported, unlockAudio } from '../lib/speech';
+import { speak, stopSpeaking, startListening, sttSupported, unlockAudio } from '../lib/speech';
 
 type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
 
@@ -490,10 +490,6 @@ export default function TheGarden({ onSave }: Props) {
   // ─── STT helpers ────────────────────────────────────────────────────────────
 
   const toggleListening = () => {
-    // Silence everything immediately — covers both branches below
-    stopAllAudio();
-    unlockAudio();
-
     if (voiceState === 'listening') {
       // User tapped to stop — trigger MediaRecorder stop → Whisper
       stopRecRef.current?.();
@@ -502,7 +498,10 @@ export default function TheGarden({ onSave }: Props) {
       return;
     }
     if (voiceState === 'processing') return; // already waiting for Whisper
-    setSpeakingId(null);
+    // Unlock Safari audio context synchronously within this gesture
+    unlockAudio();
+    // Stop any ongoing TTS first
+    stopSpeakingNow();
 
     setVoiceState('listening');
     const capturedImage = selectedImage;
@@ -594,7 +593,7 @@ export default function TheGarden({ onSave }: Props) {
     }
   };
 
-  const handleSend = () => { stopAllAudio(); unlockAudio(); sendMessage(inputText); };
+  const handleSend = () => { unlockAudio(); sendMessage(inputText); };
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   };
