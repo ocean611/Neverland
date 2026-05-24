@@ -142,10 +142,10 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   });
 }
 
-// ─── STT via MediaRecorder → Whisper ─────────────────────────────────────────
-// Uses the standard MediaRecorder API (works on Safari 16+, all modern browsers).
-// On stop, the accumulated audio chunks are sent to the Whisper transcription
-// endpoint using the same OpenAI key/base-URL stored for TTS.
+// ─── STT via MediaRecorder → Whisper (with Web Speech API fallback) ──────────
+// Primary path: MediaRecorder → Blob → File → Whisper API
+// Fallback path: if Whisper fetch throws (e.g. Safari network block), silently
+//   degrade to window.webkitSpeechRecognition / window.SpeechRecognition.
 
 export interface RecognitionHandlers {
   onResult: (text: string) => void;
@@ -153,30 +153,45 @@ export interface RecognitionHandlers {
   onEnd: () => void;
 }
 
-// Pick the best supported MIME type for the current browser.
-// Safari only supports audio/mp4; Chrome/Firefox prefer audio/webm.
-// We try webm first (better Whisper compatibility), fall back to mp4.
-function bestMimeType(): string {
-  const candidates = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/mp4',
-    'audio/ogg;codecs=opus',
-  ];
-  for (const t of candidates) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) return t;
-  }
-  return '';
+// Detect the MIME type Safari actually supports at runtime.
+// Safari 16+ supports audio/mp4 only; Chrome/Firefox support audio/webm.
+function detectMime(): { mimeType: string; extension: string } {
+  if (typeof MediaRecorder === 'undefined') return { mimeType: 'audio/mp4', extension: 'm4a' };
+  if (MediaRecorder.isTypeSupported('audio/webm')) return { mimeType: 'audio/webm', extension: 'webm' };
+  if (MediaRecorder.isTypeSupported('audio/mp4'))  return { mimeType: 'audio/mp4',  extension: 'm4a'  };
+  if (MediaRecorder.isTypeSupported('audio/ogg'))  return { mimeType: 'audio/ogg',  extension: 'ogg'  };
+  return { mimeType: '', extension: 'webm' };
 }
 
-// Map MIME type to a Whisper-accepted filename (no subdirectory, explicit extension).
-// Safari records audio/mp4 → speech.m4a; Chrome records audio/webm → speech.webm.
-// The filename suffix is what matters — servers use it to detect codec, not the MIME header.
-function mimeToFilename(mime: string): string {
-  if (mime.startsWith('audio/webm')) return 'speech.webm';
-  if (mime.startsWith('audio/ogg'))  return 'speech.ogg';
-  if (mime.startsWith('audio/mp4'))  return 'speech.m4a';
-  return 'speech.webm';
+// Web Speech API fallback — used when Whisper fetch fails (e.g. Safari network block).
+// Starts a fresh recognition session and resolves once a result or error arrives.
+function fallbackWebSpeech(handlers: RecognitionHandlers): boolean {
+  const SR = (window as unknown as { SpeechRecognition?: new () => SpeechRecognition; webkitSpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition
+          ?? (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition;
+  if (!SR) return false;
+
+  console.log('[STT] Falling back to Web Speech API');
+  const rec = new SR();
+  rec.lang = navigator.language || 'zh-CN';
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+
+  rec.onresult = (e: SpeechRecognitionEvent) => {
+    const text = e.results[0]?.[0]?.transcript?.trim() ?? '';
+    if (text) {
+      handlers.onResult(text);
+    } else {
+      handlers.onError('未能识别到语音内容，请再试一次。');
+      handlers.onEnd();
+    }
+  };
+  rec.onerror = () => {
+    handlers.onError('语音识别请求失败，请检查网络和 API Key。');
+    handlers.onEnd();
+  };
+  rec.onend = () => { /* result/error fires first */ };
+
+  try { rec.start(); return true; } catch { return false; }
 }
 
 export function startListening(handlers: RecognitionHandlers): (() => void) | null {
@@ -192,7 +207,7 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
   }
 
   const baseUrl = getOpenAIBaseUrl().replace(/\/$/, '');
-  const preferredMime = bestMimeType();
+  const { mimeType: preferredMime, extension } = detectMime();
   const chunks: BlobPart[] = [];
   let recorder: MediaRecorder | null = null;
   let stream:   MediaStream   | null = null;
@@ -203,11 +218,10 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       if (stopped) { s.getTracks().forEach(t => t.stop()); return; }
       stream = s;
 
-      // Create recorder — try preferred MIME, fall back to browser default
+      // Initialise recorder with the browser's native supported MIME type
       try {
         recorder = new MediaRecorder(s, preferredMime ? { mimeType: preferredMime } : {});
       } catch {
-        // Safari may throw if mimeType isn't supported despite isTypeSupported returning true
         recorder = new MediaRecorder(s);
       }
 
@@ -218,7 +232,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       };
 
       recorder.onstop = async () => {
-        // Stop mic tracks AFTER onstop fires so the final chunk is fully written
         stream?.getTracks().forEach(t => t.stop());
 
         const totalSize = chunks.reduce((n, c) => n + (c instanceof Blob ? c.size : 0), 0);
@@ -230,36 +243,33 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
           return;
         }
 
-        const actualMime = recorder!.mimeType || preferredMime || 'audio/webm';
+        const actualMime = recorder!.mimeType || preferredMime || 'audio/mp4';
+        // Derive extension from the actual recorder MIME in case it differed from preferred
+        const actualExt  = actualMime.includes('webm') ? 'webm' : actualMime.includes('ogg') ? 'ogg' : extension;
         const blob       = new Blob(chunks, { type: actualMime });
-        const filename   = mimeToFilename(actualMime);
 
-        console.log(`[STT] Sending blob: ${blob.size} bytes, type=${blob.type}, filename=${filename}`);
-
-        // Guard: reject empty blob before hitting the network (Safari can produce these)
         if (blob.size === 0) {
           handlers.onError('未检测到声音，请检查麦克风权限或重试。');
           handlers.onEnd();
           return;
         }
 
+        // Wrap in a File object — Safari's FormData serialiser handles File more
+        // reliably than a raw Blob, and the explicit filename suffix tells Whisper
+        // the container format without relying on the Content-Type header.
+        const file = new File([blob], `speech.${actualExt}`, { type: actualMime });
+        console.log(`[STT] Uploading File: ${file.size} bytes, name=${file.name}`);
+
         const form = new FormData();
-        // Explicit filename with extension is required — Safari's server rejects
-        // blobs without a suffix because it cannot infer the codec from MIME alone.
-        // Do NOT set Content-Type header — let the browser add the multipart boundary.
-        form.append('file', blob, filename);
+        form.append('file', file);
         form.append('model', 'whisper-1');
 
-        // Build the transcription URL from stored base URL, handling any trailing slash
         const whisperUrl = `${baseUrl}/audio/transcriptions`.replace(/([^:])\/\/+/g, '$1/');
 
         try {
           const res = await fetch(whisperUrl, {
             method: 'POST',
-            headers: {
-              Authorization: `Bearer ${key}`,
-              // Content-Type intentionally omitted — browser sets it with the FormData boundary
-            },
+            headers: { Authorization: `Bearer ${key}` },
             body: form,
           });
 
@@ -282,10 +292,13 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
             handlers.onEnd();
           }
         } catch (e) {
-          console.error('[STT] fetch error:', e);
-          const msg = e instanceof Error ? e.message : String(e);
-          handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
-          handlers.onEnd();
+          // Whisper fetch blocked (common on Safari) — silently try Web Speech API
+          console.warn('[STT] Whisper fetch failed, trying Web Speech API fallback:', e);
+          if (!fallbackWebSpeech(handlers)) {
+            const msg = e instanceof Error ? e.message : String(e);
+            handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
+            handlers.onEnd();
+          }
         }
       };
 
@@ -296,7 +309,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
         handlers.onEnd();
       };
 
-      // Use 1000ms chunks — Safari flushes more reliably at longer intervals
       recorder.start(1000);
       console.log('[STT] Recording started');
     })
