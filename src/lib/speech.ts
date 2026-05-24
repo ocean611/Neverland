@@ -8,14 +8,21 @@ const VOICES: Record<Companion, string> = {
   elora:  'nova',
 };
 
-// ─── Single global Audio element ─────────────────────────────────────────────
-// One persistent instance reused for every playback. Safari requires the audio
-// context to be unlocked by a synchronous user gesture; reusing the same element
-// keeps that unlock active for the entire session.
+// ─── Global TTS player ────────────────────────────────────────────────────────
+// A single persistent <audio id="tts-player"> element declared in index.html.
+// Reusing the same DOM element is the only reliable way to satisfy Safari's
+// autoplay policy: once unlocked via a user gesture, the element stays
+// unlocked for the entire session.
 
-const globalAudio = new Audio();
-globalAudio.preload = 'none';
+function getTTSPlayer(): HTMLAudioElement {
+  return document.getElementById('tts-player') as HTMLAudioElement;
+}
 
+// A tiny silent WAV used to "burn" the autoplay permission in the same
+// synchronous call stack as the user gesture, before any async work begins.
+const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+
+let audioUnlocked = false;
 let activeObjectUrl: string | null = null;
 
 function revokeActive(): void {
@@ -25,21 +32,24 @@ function revokeActive(): void {
   }
 }
 
-// ─── Safari audio unlock ──────────────────────────────────────────────────────
-// Call this inside any synchronous user-gesture handler (onClick, onPointerDown).
-// Playing a silent clip on the SAME Audio element we use for real playback is
-// the most reliable unlock strategy across all iOS Safari versions.
-
-const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-let audioUnlocked = false;
+// ─── Sync unlock (call inside a user-gesture handler, before any await) ───────
+// Assigns a silent clip to the player and immediately plays+pauses it.
+// Safari records this as "user-initiated playback" on this element, which
+// allows subsequent async .play() calls on the same element to succeed.
 
 export function unlockAudio(): void {
   if (audioUnlocked) return;
-  globalAudio.src = SILENT_WAV;
-  globalAudio.volume = 0;
-  globalAudio.play()
-    .then(() => { audioUnlocked = true; globalAudio.volume = 1; })
-    .catch(() => { /* will retry on next gesture */ });
+  const player = getTTSPlayer();
+  player.src = SILENT_WAV;
+  player.volume = 0;
+  const p = player.play();
+  if (p) {
+    p.then(() => {
+      player.pause();
+      player.volume = 1;
+      audioUnlocked = true;
+    }).catch(() => { /* will retry on the next gesture */ });
+  }
 }
 
 // ─── STT feature detection ────────────────────────────────────────────────────
@@ -51,8 +61,9 @@ export const sttSupported = !!(navigator.mediaDevices && navigator.mediaDevices.
 let pendingBgmRestore: (() => void) | null = null;
 
 export function stopSpeaking(): void {
-  globalAudio.pause();
-  globalAudio.src = '';
+  const player = getTTSPlayer();
+  player.pause();
+  player.src = '';
   revokeActive();
   if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
 }
@@ -79,10 +90,28 @@ export function setOpenAIBaseUrl(url: string): void {
   localStorage.setItem('neverland_openai_base_url', url.trim() || 'https://api.openai.com/v1');
 }
 
+// Web Speech API fallback — used when audio fails to load/play.
+function fallbackSpeechSynthesis(text: string, opts: SpeakOptions): void {
+  if (!window.speechSynthesis) {
+    opts.onError?.('Audio playback failed and speech synthesis is unavailable.');
+    opts.onEnd?.();
+    return;
+  }
+  window.speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = 'en-US';
+  utt.onstart  = () => opts.onStart?.();
+  utt.onend    = () => opts.onEnd?.();
+  utt.onerror  = () => { opts.onError?.('Speech synthesis failed.'); opts.onEnd?.(); };
+  window.speechSynthesis.speak(utt);
+}
+
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
-  // Stop any current playback and release the previous blob URL
-  globalAudio.pause();
-  globalAudio.src = '';
+  const player = getTTSPlayer();
+
+  // Stop any current playback
+  player.pause();
+  player.src = '';
   revokeActive();
 
   const key = getOpenAIKey();
@@ -115,7 +144,7 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     return;
   }
 
-  // Convert stream to blob → ObjectURL → assign to the already-unlocked global element
+  // Convert response to blob → ObjectURL
   const blob = await res.blob();
   const url  = URL.createObjectURL(blob);
   activeObjectUrl = url;
@@ -124,22 +153,43 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   const restoreBgm = duckBgm(0.22);
   pendingBgmRestore = restoreBgm;
 
-  globalAudio.onplay  = () => opts.onStart?.();
-  globalAudio.onended = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
-  globalAudio.onerror = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
-  globalAudio.volume  = 1;
-  globalAudio.src     = url;
+  player.onplay  = () => opts.onStart?.();
+  player.onended = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
 
-  globalAudio.play().catch((e: unknown) => {
+  // onerror on the audio element means the blob itself failed to decode —
+  // fall through to speechSynthesis rather than showing an error.
+  player.onerror = () => {
+    revokeActive();
+    restoreBgm();
+    pendingBgmRestore = null;
+    fallbackSpeechSynthesis(text, opts);
+  };
+
+  player.volume = 1;
+  player.src    = url;
+
+  try {
+    await player.play();
+  } catch (e: unknown) {
     const name = e instanceof DOMException ? e.name : '';
     if (name === 'NotAllowedError') {
-      opts.onError?.('Tap anywhere first to enable audio, then press the speaker button again.');
+      // Unlock failed — try speech synthesis so the user still hears something
+      revokeActive();
+      restoreBgm();
+      pendingBgmRestore = null;
+      fallbackSpeechSynthesis(text, {
+        onStart: opts.onStart,
+        onEnd:   opts.onEnd,
+        // Don't surface a hard error — synthesis is the transparent fallback
+      });
     } else {
+      revokeActive();
+      restoreBgm();
+      pendingBgmRestore = null;
       opts.onError?.(`Playback failed: ${e instanceof Error ? e.message : String(e)}`);
+      opts.onEnd?.();
     }
-    revokeActive();
-    opts.onEnd?.();
-  });
+  }
 }
 
 // ─── STT via MediaRecorder → Whisper (with Web Speech API fallback) ──────────
@@ -218,7 +268,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       if (stopped) { s.getTracks().forEach(t => t.stop()); return; }
       stream = s;
 
-      // Initialise recorder with the browser's native supported MIME type
       try {
         recorder = new MediaRecorder(s, preferredMime ? { mimeType: preferredMime } : {});
       } catch {
@@ -244,7 +293,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
         }
 
         const actualMime = recorder!.mimeType || preferredMime || 'audio/mp4';
-        // Derive extension from the actual recorder MIME in case it differed from preferred
         const actualExt  = actualMime.includes('webm') ? 'webm' : actualMime.includes('ogg') ? 'ogg' : extension;
         const blob       = new Blob(chunks, { type: actualMime });
 
@@ -254,9 +302,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
           return;
         }
 
-        // Wrap in a File object — Safari's FormData serialiser handles File more
-        // reliably than a raw Blob, and the explicit filename suffix tells Whisper
-        // the container format without relying on the Content-Type header.
         const file = new File([blob], `speech.${actualExt}`, { type: actualMime });
         console.log(`[STT] Uploading File: ${file.size} bytes, name=${file.name}`);
 
@@ -292,7 +337,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
             handlers.onEnd();
           }
         } catch (e) {
-          // Whisper fetch blocked (common on Safari) — silently try Web Speech API
           console.warn('[STT] Whisper fetch failed, trying Web Speech API fallback:', e);
           if (!fallbackWebSpeech(handlers)) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -325,14 +369,11 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       handlers.onEnd();
     });
 
-  // Called when user taps mic again — triggers recorder.onstop which sends to Whisper
   return () => {
     stopped = true;
     if (recorder && recorder.state === 'recording') {
-      // requestData flushes any buffered audio before stop fires onstop
       try { recorder.requestData(); } catch { /* ignore */ }
       try { recorder.stop(); } catch { /* ignore */ }
-      // Tracks are stopped inside onstop, not here, to avoid losing the final chunk
     } else {
       stream?.getTracks().forEach(t => t.stop());
     }
