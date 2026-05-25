@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Image, Send, BookmarkPlus, Check, AlertCircle, Volume2, VolumeX, RotateCcw, X } from 'lucide-react';
 import type { Message } from '../lib/storage';
-import { sendMessage as sendToAI, translateToChineseFallback, getApiKey, getProvider } from '../lib/ai';
+import { sendMessageWithEarlyTTS, translateToChineseFallback, getApiKey, getProvider } from '../lib/ai';
 import { speak, stopSpeaking, unlockAudio } from '../lib/speech';
 
 interface ChatMessage extends Message {
@@ -426,8 +426,22 @@ export default function TheGarden({ onSave }: Props) {
 
     try {
       const historyWithout = buildHistory(messages);
-      const reply = await sendToAI(historyWithout, trimmed, image);
       const aiId = nextId++;
+      let ttsStarted = false;
+
+      // Stream AI response; fire TTS as soon as english text is detected
+      // so TTS API call overlaps with remaining AI generation.
+      const reply = await sendMessageWithEarlyTTS(
+        historyWithout,
+        trimmed,
+        image ?? null,
+        (earlyEnglish: string) => {
+          if (!ttsStarted && earlyEnglish) {
+            ttsStarted = true;
+            speakMessage(earlyEnglish, aiId);
+          }
+        },
+      );
 
       setMessages(prev => {
         const without = prev.filter(m => !m.isThinking);
@@ -439,7 +453,10 @@ export default function TheGarden({ onSave }: Props) {
         retryTranslation(aiId, reply.english);
       }
 
-      speakMessage(reply.english, aiId);
+      // If the streaming callback didn't fire (very short response, race), speak now
+      if (!ttsStarted && reply.english) {
+        speakMessage(reply.english, aiId);
+      }
     } catch (err) {
       const raw = (err as Error).message ?? 'Unknown error';
       const friendly = raw === 'NO_KEY'
