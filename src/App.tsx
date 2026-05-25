@@ -5,7 +5,7 @@ import TheGarden from './views/TheGarden';
 import Memory from './views/Memory';
 import SettingsModal from './components/SettingsModal';
 import { loadMemories, saveMemory, deleteMemory, type MemoryRecord, type Message } from './lib/storage';
-import { getBgmVolume, setBgmEnabled, setupBgm, resumeAudioContext } from './lib/bgm';
+import { getBgmVolume, setBgmEnabled, setupBgmPipeline, resumeAudioContext } from './lib/bgm';
 
 const BGM_URL = 'https://vewuxryfkugfffjfhhuk.supabase.co/storage/v1/object/public/assets/124803335-1-208.mp3';
 
@@ -40,13 +40,14 @@ export default function App() {
     el.volume = getBgmVolume();
   }, [settingsOpen]);
 
-  // Expose bgm element globally so TTS can duck it, and wire through Web Audio API
-  // so volume control works on iOS (where HTMLMediaElement.volume is read-only).
+  // Expose bgm element globally so TTS can duck it.
+  // Pipeline (MediaElement → GainNode) is set up lazily on first user tap
+  // because iOS requires the AudioContext to be "running" when
+  // createMediaElementSource() is called.
   useEffect(() => {
     const el = bgmRef.current;
     if (el) {
       (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl = el;
-      setupBgm(el);
     }
   }, []);
 
@@ -58,8 +59,11 @@ export default function App() {
       setBgmPlaying(false);
       setBgmEnabled(false);
     } else {
-      // Ensure AudioContext is running so audio routes through GainNode
+      // 1) Resume AudioContext (requires user gesture on iOS)
       await resumeAudioContext();
+      // 2) Now that context is running, wire BGM through GainNode
+      setupBgmPipeline(el);
+      // 3) Start playback — audio routes through the GainNode pipeline
       el.play().catch(() => {});
       setBgmPlaying(true);
       setBgmEnabled(true);

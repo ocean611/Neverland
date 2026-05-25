@@ -1,5 +1,5 @@
 import { getCompanion, type Companion, getOpenAIKey, getOpenAIBaseUrl } from './ai';
-import { duckBgm, getSharedAudioContext, resumeAudioContext } from './bgm';
+import { duckBgm, getSharedAudioContext, resumeAudioContext, setupBgmPipeline } from './bgm';
 
 // ─── OpenAI voice mapping ─────────────────────────────────────────────────────
 
@@ -54,7 +54,13 @@ export function unlockAudio(): void {
   if (audioUnlocked) return;
 
   resumeAudioContext()
-    .then(() => { audioUnlocked = true; })
+    .then(() => {
+      audioUnlocked = true;
+      // While AudioContext is running + user gesture active, wire BGM
+      // through GainNode so ducking works on iOS/Android.
+      const bgmEl = (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl;
+      if (bgmEl) setupBgmPipeline(bgmEl);
+    })
     .catch(() => { /* fall through to strategy 2 */ });
 
   const player = getTTSPlayer();
