@@ -1,5 +1,5 @@
 import { getCompanion, type Companion, getOpenAIKey, getOpenAIBaseUrl } from './ai';
-import { duckBgm } from './bgm';
+import { duckBgm, getSharedAudioContext, resumeAudioContext } from './bgm';
 
 // ─── OpenAI voice mapping ─────────────────────────────────────────────────────
 
@@ -11,23 +11,28 @@ const VOICES: Record<Companion, string> = {
 // ─── DOM-based audio element ─────────────────────────────────────────────────
 
 function getTTSPlayer(): HTMLAudioElement {
-  return document.getElementById('tts-player') as HTMLAudioElement;
+  let el = document.getElementById('tts-player') as HTMLAudioElement;
+  if (!el) {
+    el = document.createElement('audio');
+    el.id = 'tts-player';
+    el.preload = 'auto';
+    document.body.appendChild(el);
+  }
+  return el;
 }
 
-// ─── Web Audio API context (primary playback engine) ──────────────────────────
+// ─── TTS gain node (shared AudioContext, separate gain for TTS boost) ─────────
 
-let audioCtx: AudioContext | null = null;
+let ttsGain: GainNode | null = null;
 
-function getAudioContext(): AudioContext {
-  if (!audioCtx) {
-    const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (Ctor) {
-      audioCtx = new Ctor();
-    } else {
-      throw new Error('Web Audio API not supported');
-    }
+function getTTSGain(): GainNode {
+  if (!ttsGain) {
+    const ctx = getSharedAudioContext();
+    ttsGain = ctx.createGain();
+    ttsGain.gain.value = 1.5; // Boost TTS volume above BGM
+    ttsGain.connect(ctx.destination);
   }
-  return audioCtx;
+  return ttsGain;
 }
 
 let activeSource: AudioBufferSourceNode | null = null;
@@ -48,16 +53,9 @@ let audioUnlocked = false;
 export function unlockAudio(): void {
   if (audioUnlocked) return;
 
-  try {
-    const ctx = getAudioContext();
-    if (ctx.state === 'suspended') {
-      ctx.resume()
-        .then(() => { audioUnlocked = true; })
-        .catch(() => { /* fall through to strategy 2 */ });
-    } else {
-      audioUnlocked = true;
-    }
-  } catch { /* Web Audio not available */ }
+  resumeAudioContext()
+    .then(() => { audioUnlocked = true; })
+    .catch(() => { /* fall through to strategy 2 */ });
 
   const player = getTTSPlayer();
   player.src = SILENT_WAV;
@@ -113,6 +111,11 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   const ttsUrl = `${baseUrl}/audio/speech`;
   console.log('[TTS] Calling:', ttsUrl);
 
+  // Start BGM duck immediately — before the TTS network call — so music
+  // fades while we wait for the API response.
+  const { restore: restoreBgm, faded: bgmFaded } = duckBgm(0.15);
+  pendingBgmRestore = restoreBgm;
+
   let res: Response;
   try {
     res = await fetch(ttsUrl, {
@@ -130,6 +133,7 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     } else {
       opts.onError?.(`Voice network error: ${msg}`);
     }
+    restoreBgm(); pendingBgmRestore = null;
     return;
   }
 
@@ -141,14 +145,17 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     } else {
       opts.onError?.(`OpenAI TTS ${res.status}: ${body.slice(0, 120)}`);
     }
+    restoreBgm(); pendingBgmRestore = null;
     return;
   }
 
-  const blob = await res.blob();
-  const arrayBuffer = await blob.arrayBuffer();
-
-  const restoreBgm = duckBgm(0.22);
-  pendingBgmRestore = restoreBgm;
+  let blob: Blob;
+  try {
+    blob = await res.blob();
+  } catch {
+    restoreBgm(); pendingBgmRestore = null;
+    return;
+  }
 
   function cleanup() {
     revokeActive();
@@ -157,28 +164,37 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     pendingBgmRestore = null;
   }
 
-  // ── Primary path: Web Audio API (reliable on iOS) ──────────────────────────
+  // ── Primary path: Web Audio API (gain-boosted, reliable on iOS) ──────────
   try {
-    const ctx = getAudioContext();
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
-    }
+    const ctx = getSharedAudioContext();
+    await resumeAudioContext();
+
     if (ctx.state === 'suspended') {
       throw new Error('AudioContext still suspended — needs user gesture');
     }
 
+    const arrayBuffer = await blob.arrayBuffer();
     const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(ctx.destination);
+
+    // Route through gain node for volume boost
+    source.connect(getTTSGain());
 
     activeSource = source;
     source.onended = () => { cleanup(); opts.onEnd?.(); };
+
+    // Wait for BGM to finish fading down before starting speech
+    await bgmFaded;
     opts.onStart?.();
     source.start(0);
     return;
-  } catch {
-    // ── Fallback: DOM audio element ───────────────────────────────────────
+  } catch (e) {
+    console.warn('[TTS] Web Audio path failed, falling back to DOM:', e);
+  }
+
+  // ── Fallback: DOM audio element ──────────────────────────────────────────
+  try {
     const url = URL.createObjectURL(blob);
     activeObjectUrl = url;
     const player = getTTSPlayer();
@@ -188,7 +204,8 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     player.onerror = () => { cleanup(); opts.onEnd?.(); };
     player.volume  = 1;
 
-    const doPlay = () => {
+    const doPlay = async () => {
+      await bgmFaded;
       player.play().catch((e: unknown) => {
         const name = e instanceof DOMException ? e.name : '';
         if (name === 'NotAllowedError') {
@@ -202,19 +219,21 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     };
 
     const onReady = () => {
-      player.removeEventListener('canplaythrough', onReady);
+      player.removeEventListener('canplay', onReady);
       clearTimeout(fallback);
       doPlay();
     };
 
-    player.addEventListener('canplaythrough', onReady, { once: true });
+    player.addEventListener('canplay', onReady, { once: true });
 
     const fallback = setTimeout(() => {
-      player.removeEventListener('canplaythrough', onReady);
+      player.removeEventListener('canplay', onReady);
       doPlay();
-    }, 3000);
+    }, 1000);
 
     player.src = url;
     player.load();
+  } catch {
+    cleanup();
   }
 }
