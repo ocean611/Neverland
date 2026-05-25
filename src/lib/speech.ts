@@ -290,6 +290,74 @@ function mimeToFilename(mime: string): string {
   return 'speech.webm';
 }
 
+// Convert AudioBuffer to WAV (PCM 16-bit mono). WAV format always has
+// correct duration in its header — fixes the Safari MediaRecorder bug where
+// audio/mp4 files have "N/A" duration that breaks proxy audio parsing.
+function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+
+  // Mix all channels down to mono for Whisper compatibility
+  const length = buffer.length;
+  const dataLength = length * (bitsPerSample / 8);
+  const headerSize = 44;
+  const totalSize = headerSize + dataLength;
+
+  const buf = new ArrayBuffer(totalSize);
+  const view = new DataView(buf);
+
+  function writeStr(offset: number, str: string) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, totalSize - 8, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);       // PCM sub-chunk size
+  view.setUint16(20, 1, true);        // audio format = PCM
+  view.setUint16(22, 1, true);        // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataLength, true);
+
+  let offset = 44;
+  for (let i = 0; i < length; i++) {
+    // Mix channels to mono
+    let sample = 0;
+    for (let ch = 0; ch < numChannels; ch++) {
+      sample += buffer.getChannelData(ch)[i];
+    }
+    sample /= numChannels;
+    // Clamp and convert to int16
+    const clamped = Math.max(-1, Math.min(1, sample));
+    const int16 = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7FFF);
+    view.setInt16(offset, int16, true);
+    offset += 2;
+  }
+
+  return buf;
+}
+
+async function convertToWav(blob: Blob): Promise<Blob | null> {
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const ctx = getAudioContext();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    const wavBuffer = audioBufferToWav(audioBuffer);
+    return new Blob([wavBuffer], { type: 'audio/wav' });
+  } catch (e) {
+    console.warn('[STT] WAV conversion failed, using original format:', e);
+    return null;
+  }
+}
+
 export function startListening(handlers: RecognitionHandlers): (() => void) | null {
   if (!sttSupported) {
     handlers.onError('此浏览器不支持麦克风录音，请使用 Safari 16+ 或 Chrome。');
@@ -358,18 +426,27 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
             }
 
             const actualMime = recorder?.mimeType || preferredMime || 'audio/mp4';
-            const blob       = new Blob(chunks, { type: actualMime });
-            const filename   = mimeToFilename(actualMime);
+            const rawBlob     = new Blob(chunks, { type: actualMime });
 
-            console.log(`[STT] Sending blob: ${blob.size} bytes, type=${blob.type}, filename=${filename}`);
+            console.log(`[STT] Raw blob: ${rawBlob.size} bytes, type=${actualMime}`);
 
-            if (blob.size === 0) {
+            if (rawBlob.size === 0) {
               settle(() => {
                 handlers.onError('未检测到声音，请确认麦克风正常工作后再试。');
                 handlers.onEnd();
               });
               return;
             }
+
+            // Convert to WAV to fix Safari's MP4 duration-metadata bug.
+            // Safari MediaRecorder produces MP4 files with "N/A" duration,
+            // which causes proxy servers to fail parsing. WAV has explicit
+            // duration in its header.
+            const wavBlob = await convertToWav(rawBlob);
+            const blob = wavBlob ?? rawBlob;
+            const filename = wavBlob ? 'speech.wav' : mimeToFilename(actualMime);
+
+            console.log(`[STT] Sending: ${blob.size} bytes, type=${blob.type}, filename=${filename}`);
 
             const form = new FormData();
             form.append('file', blob, filename);
