@@ -117,10 +117,10 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   const ttsUrl = `${baseUrl}/audio/speech`;
   console.log('[TTS] Calling:', ttsUrl);
 
-  // Start BGM duck immediately — before the TTS network call — so music
-  // fades while we wait for the API response.
-  const { restore: restoreBgm, faded: bgmFaded } = duckBgm(0.15);
-  pendingBgmRestore = restoreBgm;
+  // restoreBgm is a no-op until duckBgm() is called (right before playback).
+  // This way BGM stays at normal volume during the TTS network round-trip.
+  let restoreBgm = () => {};
+  pendingBgmRestore = null;
 
   let res: Response;
   try {
@@ -139,7 +139,6 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     } else {
       opts.onError?.(`Voice network error: ${msg}`);
     }
-    restoreBgm(); pendingBgmRestore = null;
     return;
   }
 
@@ -151,7 +150,6 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     } else {
       opts.onError?.(`OpenAI TTS ${res.status}: ${body.slice(0, 120)}`);
     }
-    restoreBgm(); pendingBgmRestore = null;
     return;
   }
 
@@ -159,7 +157,6 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   try {
     blob = await res.blob();
   } catch {
-    restoreBgm(); pendingBgmRestore = null;
     return;
   }
 
@@ -184,14 +181,15 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
 
-    // Route through gain node for volume boost
     source.connect(getTTSGain());
-
     activeSource = source;
     source.onended = () => { cleanup(); opts.onEnd?.(); };
 
-    // Wait for BGM to finish fading down before starting speech
-    await bgmFaded;
+    // Duck BGM right when TTS starts — fade happens in parallel with speech
+    const { restore } = duckBgm(0.15);
+    restoreBgm = restore;
+    pendingBgmRestore = restore;
+
     opts.onStart?.();
     source.start(0);
     return;
@@ -210,8 +208,11 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     player.onerror = () => { cleanup(); opts.onEnd?.(); };
     player.volume  = 1;
 
-    const doPlay = async () => {
-      await bgmFaded;
+    const doPlay = () => {
+      // Duck BGM when DOM audio starts playing
+      const { restore } = duckBgm(0.15);
+      restoreBgm = restore;
+      pendingBgmRestore = restore;
       player.play().catch((e: unknown) => {
         const name = e instanceof DOMException ? e.name : '';
         if (name === 'NotAllowedError') {
