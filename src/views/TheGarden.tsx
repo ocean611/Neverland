@@ -228,7 +228,7 @@ function AIBubble({ msg, isSpeaking, onSpeak, onStop, onRetryTranslation }: AIBu
       {/* Speaker button */}
       {msg.english && (
         <motion.button
-          onClick={e => { e.stopPropagation(); isSpeaking ? onStop() : onSpeak(msg.english!); }}
+          onClick={e => { e.stopPropagation(); unlockAudio(); isSpeaking ? onStop() : onSpeak(msg.english!); }}
           className="flex-shrink-0 w-7 h-7 rounded-xl flex items-center justify-center mb-0.5"
           style={{
             background: isSpeaking ? 'rgba(80,200,140,0.15)' : 'rgba(255,255,255,0.05)',
@@ -370,6 +370,7 @@ export default function TheGarden({ onSave }: Props) {
   // ─── TTS helpers ────────────────────────────────────────────────────────────
 
   const speakMessage = useCallback((text: string, id: number) => {
+    unlockAudio();
     stopSpeaking();
     setSpeakingId(id);
     setVoiceState('speaking');
