@@ -242,17 +242,26 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
   let recorder: MediaRecorder | null = null;
   let stream:   MediaStream   | null = null;
   let stopped = false;
+  let stopTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  // Shared cleanup — ensures handlers always fire at most once and the
+  // UI never gets stuck in "processing" state.
+  let settled = false;
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    if (stopTimeout) { clearTimeout(stopTimeout); stopTimeout = null; }
+    fn();
+  };
 
   navigator.mediaDevices.getUserMedia({ audio: true })
     .then(s => {
       if (stopped) { s.getTracks().forEach(t => t.stop()); return; }
       stream = s;
 
-      // Create recorder — try preferred MIME, fall back to browser default
       try {
         recorder = new MediaRecorder(s, preferredMime ? { mimeType: preferredMime } : {});
       } catch {
-        // Safari may throw if mimeType isn't supported despite isTypeSupported returning true
         recorder = new MediaRecorder(s);
       }
 
@@ -262,86 +271,109 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
         if (e.data && e.data.size > 0) chunks.push(e.data);
       };
 
-      recorder.onstop = async () => {
-        // Stop mic tracks AFTER onstop fires so the final chunk is fully written
-        stream?.getTracks().forEach(t => t.stop());
+      recorder.onstop = () => {
+        // Wrap everything so a throw inside onstop never leaves the UI stuck.
+        void (async () => {
+          try {
+            // Safari bug: the final dataavailable chunk may arrive AFTER onstop.
+            // Wait one microtask tick so late chunks land before we assemble.
+            await new Promise(r => setTimeout(r, 50));
 
-        const totalSize = chunks.reduce((n, c) => n + (c instanceof Blob ? c.size : 0), 0);
-        console.log(`[STT] onstop: ${chunks.length} chunks, ~${(totalSize / 1024).toFixed(1)} KB`);
+            // Stop mic tracks now that recording is fully done
+            stream?.getTracks().forEach(t => t.stop());
 
-        if (chunks.length === 0 || totalSize === 0) {
-          handlers.onError('未录到音频（大小为 0），请检查麦克风权限后重试。');
-          handlers.onEnd();
-          return;
-        }
+            const totalSize = chunks.reduce((n, c) => n + (c instanceof Blob ? c.size : 0), 0);
+            console.log(`[STT] onstop: ${chunks.length} chunks, ~${(totalSize / 1024).toFixed(1)} KB`);
 
-        const actualMime = recorder!.mimeType || preferredMime || 'audio/webm';
-        const blob       = new Blob(chunks, { type: actualMime });
-        const filename   = mimeToFilename(actualMime);
+            if (chunks.length === 0 || totalSize === 0) {
+              settle(() => {
+                handlers.onError('未录到音频 — 请确认已授予麦克风权限，说完话后再点一次麦克风按钮结束录音。');
+                handlers.onEnd();
+              });
+              return;
+            }
 
-        console.log(`[STT] Sending blob: ${blob.size} bytes, type=${blob.type}, filename=${filename}`);
+            // On mobile Safari, use the recorder's actual mimeType
+            const actualMime = recorder?.mimeType || preferredMime || 'audio/mp4';
+            const blob       = new Blob(chunks, { type: actualMime });
+            const filename   = mimeToFilename(actualMime);
 
-        // Guard: reject empty blob before hitting the network (Safari can produce these)
-        if (blob.size === 0) {
-          handlers.onError('未检测到声音，请检查麦克风权限或重试。');
-          handlers.onEnd();
-          return;
-        }
+            console.log(`[STT] Sending blob: ${blob.size} bytes, type=${blob.type}, filename=${filename}`);
 
-        const form = new FormData();
-        // Explicit filename with extension is required — Safari's server rejects
-        // blobs without a suffix because it cannot infer the codec from MIME alone.
-        // Do NOT set Content-Type header — let the browser add the multipart boundary.
-        form.append('file', blob, filename);
-        form.append('model', 'whisper-1');
+            if (blob.size === 0) {
+              settle(() => {
+                handlers.onError('未检测到声音，请确认麦克风正常工作后再试。');
+                handlers.onEnd();
+              });
+              return;
+            }
 
-        // Build the transcription URL from stored base URL, handling any trailing slash
-        const whisperUrl = `${baseUrl}/audio/transcriptions`.replace(/([^:])\/\/+/g, '$1/');
+            const form = new FormData();
+            form.append('file', blob, filename);
+            form.append('model', 'whisper-1');
 
-        try {
-          const res = await fetch(whisperUrl, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${key}`,
-              // Content-Type intentionally omitted — browser sets it with the FormData boundary
-            },
-            body: form,
-          });
+            const whisperUrl = `${baseUrl}/audio/transcriptions`.replace(/([^:])\/\/+/g, '$1/');
 
-          if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            console.error('[STT] Whisper error', res.status, body);
-            handlers.onError(`语音识别失败 (${res.status})：${body.slice(0, 120)}`);
-            handlers.onEnd();
-            return;
+            try {
+              const res = await fetch(whisperUrl, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${key}` },
+                body: form,
+              });
+
+              if (!res.ok) {
+                const body = await res.text().catch(() => '');
+                console.error('[STT] Whisper error', res.status, body);
+                settle(() => {
+                  handlers.onError(`语音识别失败 (${res.status})：${body.slice(0, 120)}`);
+                  handlers.onEnd();
+                });
+                return;
+              }
+
+              const data = await res.json() as { text?: string };
+              const text = data.text?.trim() ?? '';
+              console.log('[STT] Transcript:', text);
+
+              if (text) {
+                settle(() => {
+                  handlers.onResult(text);
+                  handlers.onEnd();
+                });
+              } else {
+                settle(() => {
+                  handlers.onError('未能识别到语音内容，请再试一次。');
+                  handlers.onEnd();
+                });
+              }
+            } catch (e) {
+              console.error('[STT] fetch error:', e);
+              const msg = e instanceof Error ? e.message : String(e);
+              settle(() => {
+                handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
+                handlers.onEnd();
+              });
+            }
+          } catch (fatal) {
+            console.error('[STT] onstop fatal error:', fatal);
+            settle(() => {
+              handlers.onError(`录音处理异常：${fatal instanceof Error ? fatal.message : String(fatal)}`);
+              handlers.onEnd();
+            });
           }
-
-          const data = await res.json() as { text?: string };
-          const text = data.text?.trim() ?? '';
-          console.log('[STT] Transcript:', text);
-
-          if (text) {
-            handlers.onResult(text);
-          } else {
-            handlers.onError('未能识别到语音内容，请再试一次。');
-            handlers.onEnd();
-          }
-        } catch (e) {
-          console.error('[STT] fetch error:', e);
-          const msg = e instanceof Error ? e.message : String(e);
-          handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
-          handlers.onEnd();
-        }
+        })();
       };
 
       recorder.onerror = (e: Event) => {
         console.error('[STT] MediaRecorder error', e);
         stream?.getTracks().forEach(t => t.stop());
-        handlers.onError('录音出错，请检查麦克风权限后重试。');
-        handlers.onEnd();
+        settle(() => {
+          handlers.onError('录音出错，请检查麦克风权限后重试。');
+          handlers.onEnd();
+        });
       };
 
-      // Use 1000ms chunks — Safari flushes more reliably at longer intervals
+      // Use 1000ms chunks — longer interval improves Safari reliability
       recorder.start(1000);
       console.log('[STT] Recording started');
     })
@@ -358,16 +390,27 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       handlers.onEnd();
     });
 
-  // Called when user taps mic again — triggers recorder.onstop which sends to Whisper
   return () => {
     stopped = true;
     if (recorder && recorder.state === 'recording') {
-      // requestData flushes any buffered audio before stop fires onstop
       try { recorder.requestData(); } catch { /* ignore */ }
       try { recorder.stop(); } catch { /* ignore */ }
-      // Tracks are stopped inside onstop, not here, to avoid losing the final chunk
+
+      // Safety net: if onstop never fires (known mobile Safari bug),
+      // force cleanup after 5 seconds so the UI doesn't hang forever.
+      stopTimeout = setTimeout(() => {
+        stream?.getTracks().forEach(t => t.stop());
+        settle(() => {
+          handlers.onError('录音结束超时，请重试。如持续出现，请尝试刷新页面。');
+          handlers.onEnd();
+        });
+      }, 5000);
     } else {
       stream?.getTracks().forEach(t => t.stop());
+      settle(() => {
+        handlers.onError('录音尚未开始，请授予麦克风权限后重试。');
+        handlers.onEnd();
+      });
     }
   };
 }
