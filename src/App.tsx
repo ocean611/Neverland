@@ -73,7 +73,7 @@ export default function App() {
   return (
     <div className="min-h-[100dvh] bg-[#080a0f] flex items-stretch justify-center">
       {/* BGM — loop, low volume, off by default to respect autoplay policy */}
-      <audio ref={bgmRef} src={BGM_URL} loop preload="none" style={{ display: 'none' }} onEnded={() => setBgmPlaying(false)} />
+      <audio ref={bgmRef} src={BGM_URL} loop preload="none" crossOrigin="anonymous" style={{ display: 'none' }} onEnded={() => setBgmPlaying(false)} />
       <div
         className="relative flex flex-col w-full md:max-w-md md:border-x md:border-white/[0.07] overflow-hidden"
         style={{

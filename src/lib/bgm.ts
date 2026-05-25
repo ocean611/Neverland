@@ -1,14 +1,27 @@
 //
-// BGM module — uses Web Audio API (MediaElementSource → GainNode → destination)
-// so volume control works on iOS where HTMLMediaElement.volume is read-only.
+// BGM module — multi-strategy volume control that works on ALL platforms.
 //
-// CRITICAL: createMediaElementSource() MUST be called while AudioContext is
-// "running" (i.e. during a user gesture on iOS), NOT during React mount.
-// Otherwise iOS Safari does not correctly route audio through the GainNode.
+// Platform capabilities:
+//   Desktop Chrome/Firefox:  el.volume writable + GainNode ✓
+//   Android Chrome:          el.volume writable ✓ (most versions)
+//   iOS Safari:              el.volume READ-ONLY ✗ — MUST use GainNode or el.muted
+//
+// Strategy (tried in order):
+//   A) MediaElementSource → GainNode (smooth fade, all platforms when CORS ok)
+//   B) el.volume (smooth fade, desktop + Android)
+//   C) el.muted toggle (no fade but GUARANTEED on iOS)
 //
 
 const BGM_VOLUME_KEY = 'neverland_bgm_volume';
 const BGM_ENABLED_KEY = 'neverland_bgm_enabled';
+
+// ─── Detect iOS ──────────────────────────────────────────────────────────────
+
+function isIOS(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
 
 // ─── Shared AudioContext ──────────────────────────────────────────────────────
 
@@ -31,26 +44,18 @@ export function resumeAudioContext(): Promise<void> {
   return Promise.resolve();
 }
 
-// ─── BGM pipeline (lazy-init during first user gesture) ──────────────────────
+// ─── BGM pipeline (MediaElementSource → GainNode → destination) ──────────────
 
 let bgmGain: GainNode | null = null;
 let bgmSource: MediaElementAudioSourceNode | null = null;
 let pipelineReady = false;
 
-// Connect an <audio> element through a GainNode.
-// MUST be called from within a user gesture (click handler) on iOS so the
-// AudioContext is in "running" state when createMediaElementSource() runs.
+// MUST be called while AudioContext is "running" (during a user gesture on iOS).
 export function setupBgmPipeline(el: HTMLAudioElement): void {
   if (pipelineReady) return;
 
   const ctx = getSharedAudioContext();
-
-  // Guard: on iOS, if context is still suspended (resume failed), bail out.
-  // The pipeline will be attempted again on the next interaction.
-  if (ctx.state !== 'running') {
-    console.warn('[BGM] AudioContext not running yet, deferring pipeline setup');
-    return;
-  }
+  if (ctx.state !== 'running') return;
 
   try {
     bgmSource = ctx.createMediaElementSource(el);
@@ -59,10 +64,14 @@ export function setupBgmPipeline(el: HTMLAudioElement): void {
     bgmSource.connect(bgmGain);
     bgmGain.connect(ctx.destination);
     pipelineReady = true;
-    console.log('[BGM] Pipeline connected: MediaElement → GainNode → destination');
+    console.log('[BGM] Pipeline ready — GainNode route active');
   } catch (e) {
-    console.error('[BGM] Failed to create MediaElementSource:', e);
+    console.warn('[BGM] createMediaElementSource failed:', e, '— will use fallback strategies');
   }
+}
+
+export function isPipelineReady(): boolean {
+  return pipelineReady;
 }
 
 // ─── Volume get/set ───────────────────────────────────────────────────────────
@@ -75,14 +84,10 @@ export function getBgmVolume(): number {
 export function setBgmVolume(v: number): void {
   const clamped = Math.min(1, Math.max(0, v));
   localStorage.setItem(BGM_VOLUME_KEY, String(clamped));
-
-  // Web Audio path (all platforms, including iOS via GainNode)
   if (bgmGain) bgmGain.gain.value = clamped;
-
-  // DOM fallback (desktop + Android where el.volume is writable)
   const el = (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl;
   if (el) {
-    try { el.volume = clamped; } catch { /* iOS read-only, silently ignored */ }
+    try { el.volume = clamped; } catch { /* iOS read-only */ }
   }
 }
 
@@ -97,10 +102,17 @@ export function setBgmEnabled(enabled: boolean): void {
 }
 
 // ─── Duck / restore ───────────────────────────────────────────────────────────
-// Dual-path volume control:
-//   Path A: GainNode (Web Audio — works on all platforms when pipeline is ready)
-//   Path B: el.volume (DOM — works on desktop + most Android)
-// On iOS, Path A is the only option; Path B is silently ignored.
+//
+// Three strategies applied simultaneously for maximum coverage:
+//   1. GainNode fade (when pipeline is ready — all platforms with CORS)
+//   2. el.volume fade (desktop + Android)
+//   3. el.muted toggle (iOS guaranteed fallback — no fade but ensures audibility)
+//
+// On iOS without pipeline, we mute BGM entirely while TTS plays.
+// This isn't a smooth fade but guarantees the AI voice is heard clearly.
+
+const FADE_STEPS = 8;
+const FADE_MS = 25;
 
 export function duckBgm(duckRatio = 0.15): { restore: () => void; faded: Promise<void> } {
   const el = (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl;
@@ -108,48 +120,66 @@ export function duckBgm(duckRatio = 0.15): { restore: () => void; faded: Promise
 
   const full = getBgmVolume();
   const ducked = full * duckRatio;
-  const steps = 8;
-  const stepMs = 25;
+  const usePipeline = pipelineReady && bgmGain;
+  const useVolumeApi = !isIOS(); // el.volume not writable on iOS
+  const useMutedFallback = isIOS() && !usePipeline;
 
   let resolveFaded: () => void;
   const faded = new Promise<void>(r => { resolveFaded = r; });
 
+  // ── Path C: muted toggle (iOS, no pipeline, no volume API) ──────────────
+  if (useMutedFallback) {
+    console.log('[BGM] Duck via muted (iOS fallback)');
+    el.muted = true;
+    const restore = () => { el.muted = false; };
+    // Resolve after a short delay so TTS has a gap before playing
+    setTimeout(resolveFaded, 200);
+    return { restore, faded };
+  }
+
+  // ── Path A+B: GainNode + el.volume fade ─────────────────────────────────
+  console.log(`[BGM] Duck via ${usePipeline ? 'GainNode' : 'volume'} fade`);
   let frame = 0;
   const fadeDown = setInterval(() => {
     frame++;
-    const v = Math.max(ducked, full - (full - ducked) * (frame / steps));
+    const v = Math.max(ducked, full - (full - ducked) * (frame / FADE_STEPS));
 
-    // Path A: GainNode (effective on all platforms when pipeline is set up)
-    if (bgmGain) bgmGain.gain.value = v;
+    if (usePipeline && bgmGain) bgmGain.gain.value = v;
+    if (useVolumeApi) {
+      try { el.volume = v; } catch { /* iOS */ }
+    }
 
-    // Path B: el.volume (effective on desktop + Android; no-op on iOS)
-    try { el.volume = v; } catch { /* iOS */ }
-
-    if (frame >= steps) {
-      if (bgmGain) bgmGain.gain.value = ducked;
-      try { el.volume = ducked; } catch { /* iOS */ }
+    if (frame >= FADE_STEPS) {
+      if (usePipeline && bgmGain) bgmGain.gain.value = ducked;
+      if (useVolumeApi) {
+        try { el.volume = ducked; } catch { /* iOS */ }
+      }
       clearInterval(fadeDown);
       resolveFaded();
     }
-  }, stepMs);
+  }, FADE_MS);
 
   const restore = () => {
     clearInterval(fadeDown);
     let f = 0;
-    const currentVol = bgmGain ? bgmGain.gain.value : ducked;
+    const startVol = usePipeline && bgmGain ? bgmGain.gain.value : ducked;
     const fadeUp = setInterval(() => {
       f++;
-      const v = Math.min(full, currentVol + (full - currentVol) * (f / steps));
+      const v = Math.min(full, startVol + (full - startVol) * (f / FADE_STEPS));
 
-      if (bgmGain) bgmGain.gain.value = v;
-      try { el.volume = v; } catch { /* iOS */ }
+      if (usePipeline && bgmGain) bgmGain.gain.value = v;
+      if (useVolumeApi) {
+        try { el.volume = v; } catch { /* iOS */ }
+      }
 
-      if (f >= steps) {
-        if (bgmGain) bgmGain.gain.value = full;
-        try { el.volume = full; } catch { /* iOS */ }
+      if (f >= FADE_STEPS) {
+        if (usePipeline && bgmGain) bgmGain.gain.value = full;
+        if (useVolumeApi) {
+          try { el.volume = full; } catch { /* iOS */ }
+        }
         clearInterval(fadeUp);
       }
-    }, stepMs);
+    }, FADE_MS);
   };
 
   return { restore, faded };
