@@ -102,17 +102,13 @@ export function setBgmEnabled(enabled: boolean): void {
 }
 
 // ─── Duck / restore ───────────────────────────────────────────────────────────
-//
-// Three strategies applied simultaneously for maximum coverage:
-//   1. GainNode fade (when pipeline is ready — all platforms with CORS)
-//   2. el.volume fade (desktop + Android)
-//   3. el.muted toggle (iOS guaranteed fallback — no fade but ensures audibility)
-//
-// On iOS without pipeline, we mute BGM entirely while TTS plays.
-// This isn't a smooth fade but guarantees the AI voice is heard clearly.
+// Smooth crossfade: BGM volume gently dips while TTS speaks, then restores.
+// Uses GainNode (all platforms when pipeline is ready) with el.volume as
+// secondary path (desktop + Android). BGM never pauses or mutes — it keeps
+// playing, just quieter.
 
-const FADE_STEPS = 8;
-const FADE_MS = 25;
+const FADE_STEPS = 15;
+const FADE_MS = 28;
 
 export function duckBgm(duckRatio = 0.15): { restore: () => void; faded: Promise<void> } {
   const el = (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl;
@@ -120,38 +116,25 @@ export function duckBgm(duckRatio = 0.15): { restore: () => void; faded: Promise
 
   const full = getBgmVolume();
   const ducked = full * duckRatio;
-  const usePipeline = pipelineReady && bgmGain;
-  const useVolumeApi = !isIOS(); // el.volume not writable on iOS
-  const useMutedFallback = isIOS() && !usePipeline;
+  const hasGain = pipelineReady && bgmGain;
+  const canSetVolume = !isIOS();
 
   let resolveFaded: () => void;
   const faded = new Promise<void>(r => { resolveFaded = r; });
 
-  // ── Path C: muted toggle (iOS, no pipeline, no volume API) ──────────────
-  if (useMutedFallback) {
-    console.log('[BGM] Duck via muted (iOS fallback)');
-    el.muted = true;
-    const restore = () => { el.muted = false; };
-    // Resolve after a short delay so TTS has a gap before playing
-    setTimeout(resolveFaded, 200);
-    return { restore, faded };
-  }
-
-  // ── Path A+B: GainNode + el.volume fade ─────────────────────────────────
-  console.log(`[BGM] Duck via ${usePipeline ? 'GainNode' : 'volume'} fade`);
   let frame = 0;
   const fadeDown = setInterval(() => {
     frame++;
     const v = Math.max(ducked, full - (full - ducked) * (frame / FADE_STEPS));
 
-    if (usePipeline && bgmGain) bgmGain.gain.value = v;
-    if (useVolumeApi) {
+    if (hasGain && bgmGain) bgmGain.gain.value = v;
+    if (canSetVolume) {
       try { el.volume = v; } catch { /* iOS */ }
     }
 
     if (frame >= FADE_STEPS) {
-      if (usePipeline && bgmGain) bgmGain.gain.value = ducked;
-      if (useVolumeApi) {
+      if (hasGain && bgmGain) bgmGain.gain.value = ducked;
+      if (canSetVolume) {
         try { el.volume = ducked; } catch { /* iOS */ }
       }
       clearInterval(fadeDown);
@@ -162,19 +145,19 @@ export function duckBgm(duckRatio = 0.15): { restore: () => void; faded: Promise
   const restore = () => {
     clearInterval(fadeDown);
     let f = 0;
-    const startVol = usePipeline && bgmGain ? bgmGain.gain.value : ducked;
+    const startVol = hasGain && bgmGain ? bgmGain.gain.value : ducked;
     const fadeUp = setInterval(() => {
       f++;
       const v = Math.min(full, startVol + (full - startVol) * (f / FADE_STEPS));
 
-      if (usePipeline && bgmGain) bgmGain.gain.value = v;
-      if (useVolumeApi) {
+      if (hasGain && bgmGain) bgmGain.gain.value = v;
+      if (canSetVolume) {
         try { el.volume = v; } catch { /* iOS */ }
       }
 
       if (f >= FADE_STEPS) {
-        if (usePipeline && bgmGain) bgmGain.gain.value = full;
-        if (useVolumeApi) {
+        if (hasGain && bgmGain) bgmGain.gain.value = full;
+        if (canSetVolume) {
           try { el.volume = full; } catch { /* iOS */ }
         }
         clearInterval(fadeUp);
