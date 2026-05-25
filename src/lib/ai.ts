@@ -1,6 +1,20 @@
 // Unified AI client — routes to Gemini or DeepSeek based on stored provider setting.
 
-import { getOpenAIKey, getOpenAIBaseUrl } from './speech';
+// ─── OpenAI TTS / Vision relay config ────────────────────────────────────────
+
+export function getOpenAIKey(): string {
+  return localStorage.getItem('neverland_openai_tts_key') ?? '';
+}
+export function setOpenAIKey(key: string): void {
+  localStorage.setItem('neverland_openai_tts_key', key.trim());
+}
+
+export function getOpenAIBaseUrl(): string {
+  return localStorage.getItem('neverland_openai_base_url') ?? 'https://api.openai.com/v1';
+}
+export function setOpenAIBaseUrl(url: string): void {
+  localStorage.setItem('neverland_openai_base_url', url.trim() || 'https://api.openai.com/v1');
+}
 
 export type Provider = 'gemini' | 'deepseek';
 export type Companion = 'arthur' | 'elora';

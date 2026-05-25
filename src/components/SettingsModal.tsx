@@ -4,9 +4,9 @@ import { X, KeyRound, Eye, EyeOff, Check, ExternalLink, Cpu, Sparkles, Music2, V
 import {
   getProvider, setProvider, getApiKey, setApiKey,
   getCompanion, setCompanion,
+  getOpenAIKey, setOpenAIKey, getOpenAIBaseUrl, setOpenAIBaseUrl,
   type Provider, type Companion,
 } from '../lib/ai';
-import { getOpenAIKey, setOpenAIKey, getOpenAIBaseUrl, setOpenAIBaseUrl } from '../lib/speech';
 import { getBgmVolume, setBgmVolume } from '../lib/bgm';
 
 interface Props {

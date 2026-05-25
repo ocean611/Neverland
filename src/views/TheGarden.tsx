@@ -1,11 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Mic, MicOff, Image, Send, BookmarkPlus, Check, AlertCircle, Volume2, VolumeX, RotateCcw, X } from 'lucide-react';
+import { Image, Send, BookmarkPlus, Check, AlertCircle, RotateCcw, X } from 'lucide-react';
 import type { Message } from '../lib/storage';
 import { sendMessage as sendToAI, translateToChineseFallback, getApiKey, getProvider } from '../lib/ai';
-import { speak, stopSpeaking, startListening, sttSupported, unlockAudio } from '../lib/speech';
-
-type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking';
 
 interface ChatMessage extends Message {
   isThinking?: boolean;
@@ -16,51 +13,22 @@ let nextId = 100;
 
 // ─── StardustOrb ──────────────────────────────────────────────────────────────
 
-function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
-  const listening   = state === 'listening';
-  const thinking    = state === 'thinking';
-  const processing  = state === 'processing';
-  const speaking    = state === 'speaking';
-  const active = listening || thinking || processing || speaking;
+function StardustOrb({ thinking }: { thinking: boolean }) {
+  const active = thinking;
 
-  const coreColor = listening
-    ? 'rgba(96,180,220,0.55)'
-    : thinking
+  const coreColor = thinking
     ? 'rgba(60,200,200,0.45)'
-    : processing
-    ? 'rgba(220,160,60,0.45)'
-    : speaking
-    ? 'rgba(80,200,140,0.48)'
     : 'rgba(80,140,180,0.32)';
 
-  const glowColor = listening
-    ? 'rgba(96,180,220,0.18)'
-    : thinking
+  const glowColor = thinking
     ? 'rgba(60,200,200,0.14)'
-    : processing
-    ? 'rgba(220,160,60,0.14)'
-    : speaking
-    ? 'rgba(80,200,140,0.16)'
     : 'rgba(80,140,180,0.10)';
 
-  const borderColor = listening
-    ? 'rgba(148,210,235,0.18)'
-    : thinking
+  const borderColor = thinking
     ? 'rgba(103,232,249,0.15)'
-    : processing
-    ? 'rgba(240,180,80,0.18)'
-    : speaking
-    ? 'rgba(100,230,160,0.18)'
     : 'rgba(148,210,235,0.08)';
 
-  const ringColor = speaking ? 'rgba(80,200,140,0.22)' : 'rgba(148,210,235,0.22)';
-  const particleColor = listening
-    ? 'rgba(148,210,235,0.7)'
-    : processing
-    ? 'rgba(240,180,80,0.65)'
-    : speaking
-    ? 'rgba(100,230,160,0.7)'
-    : 'rgba(148,210,235,0.35)';
+  const particleColor = 'rgba(148,210,235,0.35)';
 
   return (
     <div className="relative flex items-center justify-center w-44 h-44">
@@ -76,42 +44,12 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
         className="absolute rounded-full"
         style={{
           width: 134, height: 134,
-          background: `radial-gradient(circle, ${listening ? 'rgba(96,180,220,0.22)' : thinking ? 'rgba(60,200,200,0.18)' : processing ? 'rgba(220,160,60,0.18)' : speaking ? 'rgba(80,200,140,0.20)' : 'rgba(80,140,180,0.12)'} 0%, transparent 65%)`,
+          background: `radial-gradient(circle, ${thinking ? 'rgba(60,200,200,0.18)' : 'rgba(80,140,180,0.12)'} 0%, transparent 65%)`,
           border: `1px solid ${borderColor}`,
         }}
         animate={{ scale: [1, 1.08, 1], opacity: [0.6, 1, 0.6] }}
         transition={{ duration: active ? 2.2 : 4, repeat: Infinity, ease: 'easeInOut', delay: 0.3 }}
       />
-
-      {/* Ripple rings — listening */}
-      <AnimatePresence>
-        {listening && [0, 0.55, 1.1].map((delay) => (
-          <motion.div
-            key={delay}
-            className="absolute rounded-full"
-            style={{ width: 90, height: 90, border: `1px solid ${ringColor}` }}
-            initial={{ scale: 1, opacity: 0.5 }}
-            animate={{ scale: 2.4, opacity: 0 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 2.2, repeat: Infinity, ease: 'easeOut', delay }}
-          />
-        ))}
-      </AnimatePresence>
-
-      {/* Ripple rings — speaking (slower, greener) */}
-      <AnimatePresence>
-        {speaking && [0, 0.7, 1.4].map((delay) => (
-          <motion.div
-            key={delay}
-            className="absolute rounded-full"
-            style={{ width: 90, height: 90, border: '1px solid rgba(80,200,140,0.22)' }}
-            initial={{ scale: 1, opacity: 0.5 }}
-            animate={{ scale: 2.2, opacity: 0 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 2.8, repeat: Infinity, ease: 'easeOut', delay }}
-          />
-        ))}
-      </AnimatePresence>
 
       {/* Thinking spinner */}
       <AnimatePresence>
@@ -123,20 +61,6 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
             animate={{ opacity: 1, rotate: 360 }}
             exit={{ opacity: 0 }}
             transition={{ rotate: { duration: 1.8, repeat: Infinity, ease: 'linear' }, opacity: { duration: 0.3 } }}
-          />
-        )}
-      </AnimatePresence>
-
-      {/* Processing spinner (Whisper transcribing) */}
-      <AnimatePresence>
-        {processing && (
-          <motion.div
-            className="absolute rounded-full"
-            style={{ width: 100, height: 100, border: '1.5px solid transparent', borderTopColor: 'rgba(240,180,80,0.55)', borderRightColor: 'rgba(240,180,80,0.15)' }}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1, rotate: 360 }}
-            exit={{ opacity: 0 }}
-            transition={{ rotate: { duration: 1.4, repeat: Infinity, ease: 'linear' }, opacity: { duration: 0.3 } }}
           />
         )}
       </AnimatePresence>
@@ -168,7 +92,7 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
         style={{
           width: 78, height: 78,
           background: `radial-gradient(circle at 38% 35%, rgba(255,255,255,0.12) 0%, ${coreColor} 40%, rgba(10,30,50,0.6) 100%)`,
-          boxShadow: `0 0 30px ${listening ? 'rgba(96,180,220,0.35)' : thinking ? 'rgba(60,200,200,0.3)' : speaking ? 'rgba(80,200,140,0.32)' : 'rgba(80,140,180,0.2)'}, inset 0 0 20px rgba(255,255,255,0.06)`,
+          boxShadow: `0 0 30px ${thinking ? 'rgba(60,200,200,0.3)' : 'rgba(80,140,180,0.2)'}, inset 0 0 20px rgba(255,255,255,0.06)`,
           border: '1px solid rgba(255,255,255,0.12)',
         }}
         animate={{ scale: [1, active ? 1.08 : 1.06, 1] }}
@@ -180,41 +104,14 @@ function StardustOrb({ state }: { state: VoiceState | 'thinking' }) {
   );
 }
 
-function Waveform({ color = 'rgba(148,210,235,0.6)' }: { color?: string }) {
-  const heights = [0.4, 0.7, 1, 0.6, 0.9, 0.5, 0.8, 0.45, 0.75, 0.55, 0.9, 0.65];
-  return (
-    <motion.div
-      className="flex items-center justify-center gap-[3px] h-7"
-      initial={{ opacity: 0, y: 4 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 4 }}
-      transition={{ duration: 0.25 }}
-    >
-      {heights.map((h, i) => (
-        <motion.div
-          key={i}
-          className="rounded-full"
-          style={{ width: 3, background: color }}
-          animate={{ scaleY: [h * 0.4, h, h * 0.5, h * 0.9, h * 0.3] }}
-          transition={{ duration: 0.8 + i * 0.04, repeat: Infinity, ease: 'easeInOut', delay: i * 0.06 }}
-          initial={{ scaleY: h * 0.4 }}
-        />
-      ))}
-    </motion.div>
-  );
-}
-
 // ─── Chat bubbles ─────────────────────────────────────────────────────────────
 
 interface AIBubbleProps {
   msg: ChatMessage;
-  isSpeaking: boolean;
-  onSpeak: (text: string) => void;
-  onStop: () => void;
   onRetryTranslation: () => void;
 }
 
-function AIBubble({ msg, isSpeaking, onSpeak, onStop, onRetryTranslation }: AIBubbleProps) {
+function AIBubble({ msg, onRetryTranslation }: AIBubbleProps) {
   const [expanded, setExpanded] = useState(false);
   const [retrying, setRetrying] = useState(false);
 
@@ -322,27 +219,6 @@ function AIBubble({ msg, isSpeaking, onSpeak, onStop, onRetryTranslation }: AIBu
         </div>
       </motion.div>
 
-      {/* Speaker button */}
-      {msg.english && (
-        <motion.button
-          onClick={e => { e.stopPropagation(); isSpeaking ? onStop() : onSpeak(msg.english!); }}
-          className="flex-shrink-0 w-7 h-7 rounded-xl flex items-center justify-center mb-0.5"
-          style={{
-            background: isSpeaking ? 'rgba(80,200,140,0.15)' : 'rgba(255,255,255,0.05)',
-            border: `1px solid ${isSpeaking ? 'rgba(80,200,140,0.25)' : 'rgba(255,255,255,0.08)'}`,
-          }}
-          initial={{ opacity: 0, scale: 0.7 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ delay: 0.3, duration: 0.2 }}
-          whileTap={{ scale: 0.87 }}
-          aria-label={isSpeaking ? 'Stop' : 'Read aloud'}
-        >
-          {isSpeaking
-            ? <VolumeX size={12} style={{ color: 'rgba(80,200,140,0.8)' }} />
-            : <Volume2 size={12} style={{ color: 'rgba(148,210,235,0.5)' }} />
-          }
-        </motion.button>
-      )}
     </div>
   );
 }
@@ -434,96 +310,21 @@ interface Props {
 }
 
 export default function TheGarden({ onSave }: Props) {
-  const [voiceState, setVoiceState] = useState<VoiceState>('idle');
   const [isThinking, setIsThinking] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
-  const [selectedImage, setSelectedImage] = useState<string | null>(null); // base64 data URL
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [hasKey, setHasKey] = useState(() => !!getApiKey(getProvider()));
-  // Track which message id is currently being spoken
-  const [speakingId, setSpeakingId] = useState<number | null>(null);
-  // Toast for mic / TTS errors
-  const [micError, setMicError] = useState<string | null>(null);
-  // iOS-style error messages are long; keep them visible longer
-  const micErrorTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textInputRef = useRef<HTMLInputElement>(null);
-  const stopRecRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     requestAnimationFrame(() => { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); });
   }, [messages, isThinking]);
-
-  // Clear mic error — longer duration for Chinese/iOS messages
-  useEffect(() => {
-    if (micErrorTimeout.current) clearTimeout(micErrorTimeout.current);
-    if (!micError) return;
-    const ms = micError.length > 40 ? 7000 : 4000;
-    micErrorTimeout.current = setTimeout(() => setMicError(null), ms);
-    return () => {
-      if (micErrorTimeout.current) clearTimeout(micErrorTimeout.current);
-    };
-  }, [micError]);
-
-  // ─── TTS helpers ────────────────────────────────────────────────────────────
-
-  const speakMessage = useCallback((text: string, id: number) => {
-    stopSpeaking();
-    setSpeakingId(id);
-    setVoiceState('speaking');
-    speak(text, {
-      onEnd: () => { setSpeakingId(null); setVoiceState('idle'); },
-      onError: (msg) => { setSpeakingId(null); setVoiceState('idle'); setMicError(msg); },
-    });
-  }, []);
-
-  const stopSpeakingNow = useCallback(() => {
-    stopSpeaking();
-    setSpeakingId(null);
-    setVoiceState('idle');
-  }, []);
-
-  // ─── STT helpers ────────────────────────────────────────────────────────────
-
-  const toggleListening = () => {
-    if (voiceState === 'listening') {
-      // User tapped to stop — trigger MediaRecorder stop → Whisper
-      stopRecRef.current?.();
-      stopRecRef.current = null;
-      setVoiceState('processing');
-      return;
-    }
-    if (voiceState === 'processing') return; // already waiting for Whisper
-    // Unlock Safari audio context synchronously within this gesture
-    unlockAudio();
-    // Stop any ongoing TTS first
-    stopSpeakingNow();
-
-    setVoiceState('listening');
-    const capturedImage = selectedImage;
-    const stop = startListening({
-      onResult: (text) => {
-        stopRecRef.current = null;
-        setVoiceState('idle');
-        setInputText(text);
-        setTimeout(() => sendMessage(text, capturedImage), 0);
-      },
-      onError: (msg) => {
-        stopRecRef.current = null;
-        setVoiceState('idle');
-        setMicError(msg);
-      },
-      onEnd: () => {
-        stopRecRef.current = null;
-        setVoiceState('idle');
-      },
-    });
-    stopRecRef.current = stop;
-  };
 
   // ─── Translation retry ────────────────────────────────────────────────────────
 
@@ -577,8 +378,6 @@ export default function TheGarden({ onSave }: Props) {
       if (!reply.chinese && reply.english) {
         retryTranslation(aiId, reply.english);
       }
-
-      speakMessage(reply.english, aiId);
     } catch (err) {
       const raw = (err as Error).message ?? 'Unknown error';
       const friendly = raw === 'NO_KEY'
@@ -593,7 +392,7 @@ export default function TheGarden({ onSave }: Props) {
     }
   };
 
-  const handleSend = () => { unlockAudio(); sendMessage(inputText); };
+  const handleSend = () => { sendMessage(inputText); };
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   };
@@ -611,19 +410,12 @@ export default function TheGarden({ onSave }: Props) {
     .filter(m => !m.isThinking && !m.error)
     .map(({ id, role, text, english, chinese, imageDataUrl }) => ({ id, role, text, english, chinese, imageDataUrl }));
 
-  const orbState: VoiceState | 'thinking' = isThinking ? 'thinking' : voiceState;
   const orbLabel = isThinking
     ? 'Thinking…'
-    : voiceState === 'listening'
-    ? 'Listening…'
-    : voiceState === 'processing'
-    ? 'Transcribing…'
-    : voiceState === 'speaking'
-    ? 'Speaking…'
-    : 'Tap the mic or type below';
+    : 'Type below to begin';
 
   return (
-    <div className="flex flex-col h-full" onClick={unlockAudio}>
+    <div className="flex flex-col h-full">
 
       {/* ── Scrollable content ── */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto custom-scrollbar">
@@ -655,30 +447,20 @@ export default function TheGarden({ onSave }: Props) {
           </motion.p>
 
           <div className="z-10">
-            <StardustOrb state={orbState} />
+            <StardustOrb thinking={isThinking} />
           </div>
 
           <div className="z-10 h-8 flex items-center justify-center mt-3">
-            <AnimatePresence mode="wait">
-              {voiceState === 'listening' && !isThinking ? (
-                <Waveform key="wave-listen" color="rgba(148,210,235,0.6)" />
-              ) : voiceState === 'processing' && !isThinking ? (
-                <Waveform key="wave-process" color="rgba(240,180,80,0.6)" />
-              ) : voiceState === 'speaking' && !isThinking ? (
-                <Waveform key="wave-speak" color="rgba(80,200,140,0.6)" />
-              ) : (
-                <motion.p
-                  key={orbLabel}
-                  className="text-[11px] tracking-[0.18em] uppercase text-white/25"
-                  initial={{ opacity: 0, y: 4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -4 }}
-                  transition={{ duration: 0.2 }}
-                >
-                  {orbLabel}
-                </motion.p>
-              )}
-            </AnimatePresence>
+            <motion.p
+              key={orbLabel}
+              className="text-[11px] tracking-[0.18em] uppercase text-white/25"
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.2 }}
+            >
+              {orbLabel}
+            </motion.p>
           </div>
         </div>
 
@@ -687,24 +469,6 @@ export default function TheGarden({ onSave }: Props) {
 
         {/* No key banner */}
         {!hasKey && <NoKeyBanner />}
-
-        {/* Error toast — handles both short English and long Chinese iOS messages */}
-        <AnimatePresence>
-          {micError && (
-            <motion.div
-              className="mx-4 mb-3 px-3 py-3 rounded-xl flex items-start gap-2.5 cursor-pointer"
-              style={{ background: 'rgba(180,40,40,0.16)', border: '1px solid rgba(220,80,80,0.22)' }}
-              initial={{ opacity: 0, y: 6, scale: 0.97 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -4, scale: 0.97 }}
-              transition={{ duration: 0.25 }}
-              onClick={() => setMicError(null)}
-            >
-              <AlertCircle size={14} className="text-red-400/70 flex-shrink-0 mt-0.5" />
-              <p className="text-[11.5px] font-light text-red-200/65 leading-relaxed">{micError}</p>
-            </motion.div>
-          )}
-        </AnimatePresence>
 
         {/* Chat messages */}
         <div className="px-4 space-y-3 pb-40">
@@ -724,9 +488,6 @@ export default function TheGarden({ onSave }: Props) {
                 <AIBubble
                   key={msg.id}
                   msg={msg}
-                  isSpeaking={speakingId === msg.id}
-                  onSpeak={(text) => speakMessage(text, msg.id)}
-                  onStop={stopSpeakingNow}
                   onRetryTranslation={() => retryTranslation(msg.id, msg.english ?? '')}
                 />
               )
@@ -791,18 +552,18 @@ export default function TheGarden({ onSave }: Props) {
             onKeyDown={handleKeyDown}
             placeholder={selectedImage ? 'Ask about the image…' : 'Say something…'}
             disabled={isThinking}
-            className="flex-1 bg-transparent text-sm font-light text-white/65 placeholder-white/18 outline-none min-w-0"
+            className="flex-1 bg-transparent text-base font-light text-white/65 placeholder-white/18 outline-none min-w-0"
             style={{ caretColor: 'rgba(148,210,235,0.8)' }}
           />
 
-          {/* Send button — active when text OR image is present */}
+          {/* Send button */}
           {(() => {
             const canSend = (!!inputText.trim() || !!selectedImage) && !isThinking;
             return (
               <motion.button
                 onClick={handleSend}
                 disabled={!canSend}
-                className="flex-shrink-0 flex items-center justify-center w-9 h-9 rounded-xl transition-all"
+                className="flex-shrink-0 flex items-center justify-center w-10 h-10 rounded-full transition-all"
                 style={{
                   background: canSend ? 'rgba(96,180,220,0.2)' : 'rgba(255,255,255,0.04)',
                   border: `1px solid ${canSend ? 'rgba(148,210,235,0.25)' : 'rgba(255,255,255,0.07)'}`,
@@ -810,51 +571,10 @@ export default function TheGarden({ onSave }: Props) {
                 whileTap={canSend ? { scale: 0.9 } : {}}
                 aria-label="Send"
               >
-                <Send size={15} style={{ color: canSend ? 'rgba(148,210,235,0.8)' : 'rgba(255,255,255,0.2)' }} />
+                <Send size={16} style={{ color: canSend ? 'rgba(148,210,235,0.8)' : 'rgba(255,255,255,0.2)' }} />
               </motion.button>
             );
           })()}
-
-          {/* Mic button */}
-          <motion.button
-            onClick={toggleListening}
-            disabled={isThinking || !sttSupported || voiceState === 'processing'}
-            className="relative flex-shrink-0 flex items-center justify-center w-12 h-12 rounded-full"
-            style={{
-              background: voiceState === 'listening'
-                ? 'radial-gradient(circle at center, rgba(220,50,60,0.5) 0%, rgba(160,30,40,0.6) 100%)'
-                : voiceState === 'processing'
-                ? 'radial-gradient(circle at center, rgba(200,140,40,0.4) 0%, rgba(140,90,20,0.5) 100%)'
-                : 'radial-gradient(circle at center, rgba(96,180,220,0.3) 0%, rgba(40,100,150,0.4) 100%)',
-              border: `1.5px solid ${voiceState === 'listening' ? 'rgba(240,80,90,0.4)' : voiceState === 'processing' ? 'rgba(240,180,60,0.35)' : 'rgba(148,210,235,0.25)'}`,
-              boxShadow: voiceState === 'listening' ? '0 0 20px rgba(220,50,60,0.35)' : voiceState === 'processing' ? '0 0 14px rgba(220,160,50,0.25)' : '0 0 12px rgba(96,180,220,0.18)',
-              backdropFilter: 'blur(12px)',
-              WebkitBackdropFilter: 'blur(12px)',
-              opacity: (isThinking || !sttSupported) ? 0.45 : 1,
-            }}
-            whileTap={!isThinking && sttSupported && voiceState !== 'processing' ? { scale: 0.9 } : {}}
-            animate={voiceState === 'listening' ? { scale: [1, 1.05, 1] } : { scale: 1 }}
-            transition={voiceState === 'listening' ? { duration: 1.8, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
-            aria-label={voiceState === 'listening' ? 'Stop recording' : voiceState === 'processing' ? 'Transcribing…' : 'Start recording'}
-          >
-            <AnimatePresence>
-              {voiceState === 'listening' && (
-                <motion.div
-                  className="absolute inset-0 rounded-full border border-red-400/30"
-                  initial={{ scale: 1, opacity: 0.6 }}
-                  animate={{ scale: 1.9, opacity: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 1.5, repeat: Infinity, ease: 'easeOut' }}
-                />
-              )}
-            </AnimatePresence>
-            {voiceState === 'listening'
-              ? <MicOff size={19} style={{ color: 'rgba(255,180,180,0.9)' }} />
-              : voiceState === 'processing'
-              ? <motion.div className="w-4 h-4 rounded-full border-2 border-t-transparent" style={{ borderColor: 'rgba(240,180,80,0.6)', borderTopColor: 'transparent' }} animate={{ rotate: 360 }} transition={{ duration: 0.9, repeat: Infinity, ease: 'linear' }} />
-              : <Mic size={19} style={{ color: 'rgba(148,210,235,0.85)' }} />
-            }
-          </motion.button>
         </div>
       </div>
     </div>
