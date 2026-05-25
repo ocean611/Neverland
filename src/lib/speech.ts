@@ -19,6 +19,27 @@ function getTTSPlayer(): HTMLAudioElement {
   return document.getElementById('tts-player') as HTMLAudioElement;
 }
 
+// ─── Web Audio API context (primary playback engine) ──────────────────────────
+// WebAudio is more reliable than <audio> elements on iOS Safari because:
+//   - Its unlock is a simple AudioContext.resume() during a user gesture
+//   - It doesn't suffer from the "display:none blocks audio pipeline" issue
+//   - decodeAudioData + AudioBufferSourceNode gives precise playback control
+
+let audioCtx: AudioContext | null = null;
+
+function getAudioContext(): AudioContext {
+  if (!audioCtx) {
+    const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (Ctor) {
+      audioCtx = new Ctor();
+    } else {
+      throw new Error('Web Audio API not supported');
+    }
+  }
+  return audioCtx;
+}
+
+let activeSource: AudioBufferSourceNode | null = null;
 let activeObjectUrl: string | null = null;
 
 function revokeActive(): void {
@@ -28,23 +49,40 @@ function revokeActive(): void {
   }
 }
 
-// ─── Safari audio unlock ──────────────────────────────────────────────────────
+// ─── Safari / mobile audio unlock ────────────────────────────────────────────
 // Call this inside any synchronous user-gesture handler (onClick, onPointerDown).
-// Playing a silent clip on the SAME Audio element we use for real playback
-// "burns" the autoplay lock so future async .play() calls succeed.
+// Strategy 1 (primary): Resume the Web Audio context. Modern iOS accepts this
+//   as a valid "user initiated audio" signal, which then allows all future
+//   AudioContext operations (decodeAudioData, source.start()) to produce sound.
+// Strategy 2 (fallback): Play a silent WAV on the DOM <audio> element to unlock
+//   the HTMLMediaElement pipeline for BGM and as a secondary guarantee.
 
 const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
 let audioUnlocked = false;
 
 export function unlockAudio(): void {
   if (audioUnlocked) return;
+
+  // Strategy 1 — Web Audio context resume (most reliable on iOS 15+)
+  try {
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') {
+      ctx.resume()
+        .then(() => { audioUnlocked = true; })
+        .catch(() => { /* fall through to strategy 2 */ });
+    } else {
+      audioUnlocked = true;
+    }
+  } catch { /* Web Audio not available */ }
+
+  // Strategy 2 — DOM audio element (legacy iOS, also unlocks BGM element)
   const player = getTTSPlayer();
   player.src = SILENT_WAV;
   player.volume = 0;
   player.load();
   player.play()
     .then(() => { player.pause(); player.currentTime = 0; player.volume = 1; audioUnlocked = true; })
-    .catch(() => { audioUnlocked = false; });
+    .catch(() => { /* strategy 1 may have already succeeded */ });
 }
 
 // ─── STT feature detection ────────────────────────────────────────────────────
@@ -56,9 +94,14 @@ export const sttSupported = !!(navigator.mediaDevices && navigator.mediaDevices.
 let pendingBgmRestore: (() => void) | null = null;
 
 export function stopSpeaking(): void {
+  // Stop Web Audio source
+  if (activeSource) {
+    try { activeSource.stop(); } catch { /* already stopped */ }
+    activeSource = null;
+  }
+  // Also stop DOM audio element (used as fallback)
   const player = getTTSPlayer();
   player.pause();
-  // NEVER set player.src = '' — it destroys the mobile audio unlock
   revokeActive();
   if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
 }
@@ -85,18 +128,11 @@ export function setOpenAIBaseUrl(url: string): void {
   localStorage.setItem('neverland_openai_base_url', url.trim() || 'https://api.openai.com/v1');
 }
 
-const TTS_CJK_REGEX = /[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/;
+const TTS_CJK_REGEX = /[　-鿿가-힯豈-﫿︰-﹏＀-￯]/;
 
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
-  const player = getTTSPlayer();
-
-  // Stop current playback WITHOUT clearing src — clearing src destroys the
-  // mobile audio unlock that unlockAudio() achieved during a user gesture.
-  player.pause();
-  player.onplay = null;
-  player.onended = null;
-  player.onerror = null;
-  revokeActive();
+  // Stop current playback
+  stopSpeaking();
 
   // Hard gate: never send CJK text to the English TTS voice engine.
   if (!text || !text.trim() || TTS_CJK_REGEX.test(text)) {
@@ -124,7 +160,12 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
       body: JSON.stringify({ model: 'tts-1', input: text, voice, speed: getCompanion() === 'arthur' ? 0.85 : 0.95 }),
     });
   } catch (e) {
-    opts.onError?.(`Voice network error: ${(e as Error).message}`);
+    const msg = (e as Error).message || String(e);
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
+      opts.onError?.('无法连接到 OpenAI 服务器。如在中国大陆使用，请在 Settings 中设置代理 URL。');
+    } else {
+      opts.onError?.(`Voice network error: ${msg}`);
+    }
     return;
   }
 
@@ -135,56 +176,78 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   }
 
   const blob = await res.blob();
-  const url  = URL.createObjectURL(blob);
-  activeObjectUrl = url;
+  const arrayBuffer = await blob.arrayBuffer();
 
   const restoreBgm = duckBgm(0.22);
   pendingBgmRestore = restoreBgm;
 
   function cleanup() {
     revokeActive();
+    activeSource = null;
     restoreBgm();
     pendingBgmRestore = null;
   }
 
-  // Set event handlers BEFORE setting src to avoid mobile race conditions
-  player.onplay  = () => opts.onStart?.();
-  player.onended = () => { cleanup(); opts.onEnd?.(); };
-  player.onerror = () => { cleanup(); opts.onEnd?.(); };
-  player.volume  = 1;
+  // ── Primary path: Web Audio API (reliable on iOS) ──────────────────────────
+  try {
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    if (ctx.state === 'suspended') {
+      throw new Error('AudioContext still suspended — needs user gesture');
+    }
 
-  // On mobile, calling play() immediately after setting src fails because
-  // not enough audio data has buffered. Wait for canplaythrough.
-  const doPlay = () => {
-    player.play().catch((e: unknown) => {
-      const name = e instanceof DOMException ? e.name : '';
-      if (name === 'NotAllowedError') {
-        opts.onError?.('Tap anywhere first to enable audio, then press the speaker button again.');
-      } else {
-        opts.onError?.(`Playback failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      cleanup();
-      opts.onEnd?.();
-    });
-  };
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
 
-  const onReady = () => {
-    player.removeEventListener('canplaythrough', onReady);
-    clearTimeout(fallback);
-    doPlay();
-  };
+    activeSource = source;
+    source.onended = () => { cleanup(); opts.onEnd?.(); };
+    opts.onStart?.();
+    source.start(0);
+    return;
+  } catch (webAudioErr) {
+    // ── Fallback: DOM audio element ───────────────────────────────────────
+    const url = URL.createObjectURL(blob);
+    activeObjectUrl = url;
+    const player = getTTSPlayer();
 
-  player.addEventListener('canplaythrough', onReady, { once: true });
+    player.onplay  = () => opts.onStart?.();
+    player.onended = () => { cleanup(); opts.onEnd?.(); };
+    player.onerror = () => { cleanup(); opts.onEnd?.(); };
+    player.volume  = 1;
 
-  // Safety fallback: if canplaythrough never fires, try anyway after 3s
-  const fallback = setTimeout(() => {
-    player.removeEventListener('canplaythrough', onReady);
-    doPlay();
-  }, 3000);
+    const doPlay = () => {
+      player.play().catch((e: unknown) => {
+        const name = e instanceof DOMException ? e.name : '';
+        if (name === 'NotAllowedError') {
+          opts.onError?.('Tap anywhere first to enable audio, then press the speaker button again.');
+        } else {
+          opts.onError?.(`Playback failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        cleanup();
+        opts.onEnd?.();
+      });
+    };
 
-  // Set src last — triggers loading
-  player.src = url;
-  player.load();
+    const onReady = () => {
+      player.removeEventListener('canplaythrough', onReady);
+      clearTimeout(fallback);
+      doPlay();
+    };
+
+    player.addEventListener('canplaythrough', onReady, { once: true });
+
+    const fallback = setTimeout(() => {
+      player.removeEventListener('canplaythrough', onReady);
+      doPlay();
+    }, 3000);
+
+    player.src = url;
+    player.load();
+  }
 }
 
 // ─── STT via MediaRecorder → Whisper ─────────────────────────────────────────
@@ -199,8 +262,6 @@ export interface RecognitionHandlers {
 }
 
 // Pick the best supported MIME type for the current browser.
-// Safari only supports audio/mp4; Chrome/Firefox prefer audio/webm.
-// We try webm first (better Whisper compatibility), fall back to mp4.
 function bestMimeType(): string {
   const candidates = [
     'audio/webm;codecs=opus',
@@ -214,9 +275,6 @@ function bestMimeType(): string {
   return '';
 }
 
-// Map MIME type to a Whisper-accepted filename (no subdirectory, explicit extension).
-// Safari records audio/mp4 → speech.m4a; Chrome records audio/webm → speech.webm.
-// The filename suffix is what matters — servers use it to detect codec, not the MIME header.
 function mimeToFilename(mime: string): string {
   if (mime.startsWith('audio/webm')) return 'speech.webm';
   if (mime.startsWith('audio/ogg'))  return 'speech.ogg';
@@ -272,14 +330,12 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
       };
 
       recorder.onstop = () => {
-        // Wrap everything so a throw inside onstop never leaves the UI stuck.
         void (async () => {
           try {
             // Safari bug: the final dataavailable chunk may arrive AFTER onstop.
             // Wait one microtask tick so late chunks land before we assemble.
             await new Promise(r => setTimeout(r, 50));
 
-            // Stop mic tracks now that recording is fully done
             stream?.getTracks().forEach(t => t.stop());
 
             const totalSize = chunks.reduce((n, c) => n + (c instanceof Blob ? c.size : 0), 0);
@@ -293,7 +349,6 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
               return;
             }
 
-            // On mobile Safari, use the recorder's actual mimeType
             const actualMime = recorder?.mimeType || preferredMime || 'audio/mp4';
             const blob       = new Blob(chunks, { type: actualMime });
             const filename   = mimeToFilename(actualMime);
@@ -325,7 +380,11 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
                 const body = await res.text().catch(() => '');
                 console.error('[STT] Whisper error', res.status, body);
                 settle(() => {
-                  handlers.onError(`语音识别失败 (${res.status})：${body.slice(0, 120)}`);
+                  if (res.status === 401 || res.status === 403) {
+                    handlers.onError('OpenAI API Key 无效或已过期，请在设置中更新。');
+                  } else {
+                    handlers.onError(`语音识别失败 (${res.status})：${body.slice(0, 120)}`);
+                  }
                   handlers.onEnd();
                 });
                 return;
@@ -349,10 +408,17 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
             } catch (e) {
               console.error('[STT] fetch error:', e);
               const msg = e instanceof Error ? e.message : String(e);
-              settle(() => {
-                handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
-                handlers.onEnd();
-              });
+              if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
+                settle(() => {
+                  handlers.onError('无法连接到 OpenAI 服务器。如在中国大陆使用，请在 Settings 中设置代理 URL。');
+                  handlers.onEnd();
+                });
+              } else {
+                settle(() => {
+                  handlers.onError(`语音识别请求失败：${msg}。请检查网络和 API Key。`);
+                  handlers.onEnd();
+                });
+              }
             }
           } catch (fatal) {
             console.error('[STT] onstop fatal error:', fatal);
