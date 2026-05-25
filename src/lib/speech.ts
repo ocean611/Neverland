@@ -8,13 +8,16 @@ const VOICES: Record<Companion, string> = {
   elora:  'nova',
 };
 
-// ─── Single global Audio element ─────────────────────────────────────────────
-// One persistent instance reused for every playback. Safari requires the audio
-// context to be unlocked by a synchronous user gesture; reusing the same element
-// keeps that unlock active for the entire session.
+// ─── DOM-based audio element ─────────────────────────────────────────────────
+// A persistent <audio id="tts-player"> element declared in index.html.
+// It MUST be in the DOM (not created via new Audio()) — iOS Safari only
+// persists autoplay permission for elements that are part of the document tree.
+// Once unlocked by a user gesture, all subsequent .play() calls on this same
+// element succeed without requiring another gesture.
 
-const globalAudio = new Audio();
-globalAudio.preload = 'none';
+function getTTSPlayer(): HTMLAudioElement {
+  return document.getElementById('tts-player') as HTMLAudioElement;
+}
 
 let activeObjectUrl: string | null = null;
 
@@ -27,19 +30,21 @@ function revokeActive(): void {
 
 // ─── Safari audio unlock ──────────────────────────────────────────────────────
 // Call this inside any synchronous user-gesture handler (onClick, onPointerDown).
-// Playing a silent clip on the SAME Audio element we use for real playback is
-// the most reliable unlock strategy across all iOS Safari versions.
+// Playing a silent clip on the SAME Audio element we use for real playback
+// "burns" the autoplay lock so future async .play() calls succeed.
 
 const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
 let audioUnlocked = false;
 
 export function unlockAudio(): void {
   if (audioUnlocked) return;
-  globalAudio.src = SILENT_WAV;
-  globalAudio.volume = 0;
-  globalAudio.play()
-    .then(() => { audioUnlocked = true; globalAudio.volume = 1; })
-    .catch(() => { /* will retry on next gesture */ });
+  const player = getTTSPlayer();
+  player.src = SILENT_WAV;
+  player.volume = 0;
+  player.load();
+  player.play()
+    .then(() => { player.pause(); player.currentTime = 0; player.volume = 1; audioUnlocked = true; })
+    .catch(() => { audioUnlocked = false; });
 }
 
 // ─── STT feature detection ────────────────────────────────────────────────────
@@ -51,8 +56,9 @@ export const sttSupported = !!(navigator.mediaDevices && navigator.mediaDevices.
 let pendingBgmRestore: (() => void) | null = null;
 
 export function stopSpeaking(): void {
-  globalAudio.pause();
-  globalAudio.src = '';
+  const player = getTTSPlayer();
+  player.pause();
+  // NEVER set player.src = '' — it destroys the mobile audio unlock
   revokeActive();
   if (pendingBgmRestore) { pendingBgmRestore(); pendingBgmRestore = null; }
 }
@@ -82,9 +88,14 @@ export function setOpenAIBaseUrl(url: string): void {
 const TTS_CJK_REGEX = /[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/;
 
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
-  // Stop any current playback and release the previous blob URL
-  globalAudio.pause();
-  globalAudio.src = '';
+  const player = getTTSPlayer();
+
+  // Stop current playback WITHOUT clearing src — clearing src destroys the
+  // mobile audio unlock that unlockAudio() achieved during a user gesture.
+  player.pause();
+  player.onplay = null;
+  player.onended = null;
+  player.onerror = null;
   revokeActive();
 
   // Hard gate: never send CJK text to the English TTS voice engine.
@@ -123,31 +134,57 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
     return;
   }
 
-  // Convert stream to blob → ObjectURL → assign to the already-unlocked global element
   const blob = await res.blob();
   const url  = URL.createObjectURL(blob);
   activeObjectUrl = url;
 
-  // Duck BGM while TTS is playing; restore when done or stopped
   const restoreBgm = duckBgm(0.22);
   pendingBgmRestore = restoreBgm;
 
-  globalAudio.onplay  = () => opts.onStart?.();
-  globalAudio.onended = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
-  globalAudio.onerror = () => { revokeActive(); restoreBgm(); pendingBgmRestore = null; opts.onEnd?.(); };
-  globalAudio.volume  = 1;
-  globalAudio.src     = url;
-
-  globalAudio.play().catch((e: unknown) => {
-    const name = e instanceof DOMException ? e.name : '';
-    if (name === 'NotAllowedError') {
-      opts.onError?.('Tap anywhere first to enable audio, then press the speaker button again.');
-    } else {
-      opts.onError?.(`Playback failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  function cleanup() {
     revokeActive();
-    opts.onEnd?.();
-  });
+    restoreBgm();
+    pendingBgmRestore = null;
+  }
+
+  // Set event handlers BEFORE setting src to avoid mobile race conditions
+  player.onplay  = () => opts.onStart?.();
+  player.onended = () => { cleanup(); opts.onEnd?.(); };
+  player.onerror = () => { cleanup(); opts.onEnd?.(); };
+  player.volume  = 1;
+
+  // On mobile, calling play() immediately after setting src fails because
+  // not enough audio data has buffered. Wait for canplaythrough.
+  const doPlay = () => {
+    player.play().catch((e: unknown) => {
+      const name = e instanceof DOMException ? e.name : '';
+      if (name === 'NotAllowedError') {
+        opts.onError?.('Tap anywhere first to enable audio, then press the speaker button again.');
+      } else {
+        opts.onError?.(`Playback failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      cleanup();
+      opts.onEnd?.();
+    });
+  };
+
+  const onReady = () => {
+    player.removeEventListener('canplaythrough', onReady);
+    clearTimeout(fallback);
+    doPlay();
+  };
+
+  player.addEventListener('canplaythrough', onReady, { once: true });
+
+  // Safety fallback: if canplaythrough never fires, try anyway after 3s
+  const fallback = setTimeout(() => {
+    player.removeEventListener('canplaythrough', onReady);
+    doPlay();
+  }, 3000);
+
+  // Set src last — triggers loading
+  player.src = url;
+  player.load();
 }
 
 // ─── STT via MediaRecorder → Whisper ─────────────────────────────────────────
