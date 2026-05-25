@@ -149,9 +149,12 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   const baseUrl = getOpenAIBaseUrl().replace(/\/$/, '');
   const voice   = VOICES[getCompanion()];
 
+  const ttsUrl = `${baseUrl}/audio/speech`;
+  console.log('[TTS] Calling:', ttsUrl);
+
   let res: Response;
   try {
-    res = await fetch(`${baseUrl}/audio/speech`, {
+    res = await fetch(ttsUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${key}`,
@@ -162,7 +165,7 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   } catch (e) {
     const msg = (e as Error).message || String(e);
     if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
-      opts.onError?.('无法连接到 OpenAI 服务器。如在中国大陆使用，请在 Settings 中设置代理 URL。');
+      opts.onError?.('无法连接到 OpenAI 服务器。如在中国大陆使用，请在 Settings → Voice → Base URL 中设置代理地址。');
     } else {
       opts.onError?.(`Voice network error: ${msg}`);
     }
@@ -171,7 +174,12 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    opts.onError?.(`OpenAI TTS ${res.status}: ${body.slice(0, 120)}`);
+    console.error('[TTS] Failed:', res.status, body.slice(0, 200));
+    if (res.status === 404) {
+      opts.onError?.(`接口不存在 (404)。请检查 Base URL 是否正确：${ttsUrl}`);
+    } else {
+      opts.onError?.(`OpenAI TTS ${res.status}: ${body.slice(0, 120)}`);
+    }
     return;
   }
 
@@ -368,6 +376,7 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
             form.append('model', 'whisper-1');
 
             const whisperUrl = `${baseUrl}/audio/transcriptions`.replace(/([^:])\/\/+/g, '$1/');
+            console.log('[STT] Calling:', whisperUrl);
 
             try {
               const res = await fetch(whisperUrl, {
@@ -378,15 +387,23 @@ export function startListening(handlers: RecognitionHandlers): (() => void) | nu
 
               if (!res.ok) {
                 const body = await res.text().catch(() => '');
-                console.error('[STT] Whisper error', res.status, body);
-                settle(() => {
-                  if (res.status === 401 || res.status === 403) {
+                console.error('[STT] Whisper error', res.status, body.slice(0, 200));
+                if (res.status === 404) {
+                  settle(() => {
+                    handlers.onError(`语音接口不存在 (404)。请检查 Base URL：${whisperUrl}`);
+                    handlers.onEnd();
+                  });
+                } else if (res.status === 401 || res.status === 403) {
+                  settle(() => {
                     handlers.onError('OpenAI API Key 无效或已过期，请在设置中更新。');
-                  } else {
+                    handlers.onEnd();
+                  });
+                } else {
+                  settle(() => {
                     handlers.onError(`语音识别失败 (${res.status})：${body.slice(0, 120)}`);
-                  }
-                  handlers.onEnd();
-                });
+                    handlers.onEnd();
+                  });
+                }
                 return;
               }
 
