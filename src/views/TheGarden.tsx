@@ -1,13 +1,16 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Image, Send, BookmarkPlus, Check, AlertCircle, RotateCcw, X } from 'lucide-react';
+import { Image, Send, BookmarkPlus, Check, AlertCircle, Volume2, VolumeX, RotateCcw, X } from 'lucide-react';
 import type { Message } from '../lib/storage';
 import { sendMessage as sendToAI, translateToChineseFallback, getApiKey, getProvider } from '../lib/ai';
+import { speak, stopSpeaking, unlockAudio } from '../lib/speech';
 
 interface ChatMessage extends Message {
   isThinking?: boolean;
   error?: string;
 }
+
+type VoiceState = 'idle' | 'speaking';
 
 let nextId = 100;
 
@@ -108,10 +111,13 @@ function StardustOrb({ thinking }: { thinking: boolean }) {
 
 interface AIBubbleProps {
   msg: ChatMessage;
+  isSpeaking: boolean;
+  onSpeak: (text: string) => void;
+  onStop: () => void;
   onRetryTranslation: () => void;
 }
 
-function AIBubble({ msg, onRetryTranslation }: AIBubbleProps) {
+function AIBubble({ msg, isSpeaking, onSpeak, onStop, onRetryTranslation }: AIBubbleProps) {
   const [expanded, setExpanded] = useState(false);
   const [retrying, setRetrying] = useState(false);
 
@@ -219,6 +225,27 @@ function AIBubble({ msg, onRetryTranslation }: AIBubbleProps) {
         </div>
       </motion.div>
 
+      {/* Speaker button */}
+      {msg.english && (
+        <motion.button
+          onClick={e => { e.stopPropagation(); isSpeaking ? onStop() : onSpeak(msg.english!); }}
+          className="flex-shrink-0 w-7 h-7 rounded-xl flex items-center justify-center mb-0.5"
+          style={{
+            background: isSpeaking ? 'rgba(80,200,140,0.15)' : 'rgba(255,255,255,0.05)',
+            border: `1px solid ${isSpeaking ? 'rgba(80,200,140,0.25)' : 'rgba(255,255,255,0.08)'}`,
+          }}
+          initial={{ opacity: 0, scale: 0.7 }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ delay: 0.3, duration: 0.2 }}
+          whileTap={{ scale: 0.87 }}
+          aria-label={isSpeaking ? 'Stop' : 'Read aloud'}
+        >
+          {isSpeaking
+            ? <VolumeX size={12} style={{ color: 'rgba(80,200,140,0.8)' }} />
+            : <Volume2 size={12} style={{ color: 'rgba(148,210,235,0.5)' }} />
+          }
+        </motion.button>
+      )}
     </div>
   );
 }
@@ -310,11 +337,15 @@ interface Props {
 }
 
 export default function TheGarden({ onSave }: Props) {
+  const [voiceState, setVoiceState] = useState<VoiceState>('idle');
   const [isThinking, setIsThinking] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [hasKey, setHasKey] = useState(() => !!getApiKey(getProvider()));
+  const [speakingId, setSpeakingId] = useState<number | null>(null);
+  const [micError, setMicError] = useState<string | null>(null);
+  const micErrorTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -325,6 +356,34 @@ export default function TheGarden({ onSave }: Props) {
     if (!el) return;
     requestAnimationFrame(() => { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); });
   }, [messages, isThinking]);
+
+  useEffect(() => {
+    if (micErrorTimeout.current) clearTimeout(micErrorTimeout.current);
+    if (!micError) return;
+    const ms = micError.length > 40 ? 7000 : 4000;
+    micErrorTimeout.current = setTimeout(() => setMicError(null), ms);
+    return () => {
+      if (micErrorTimeout.current) clearTimeout(micErrorTimeout.current);
+    };
+  }, [micError]);
+
+  // ─── TTS helpers ────────────────────────────────────────────────────────────
+
+  const speakMessage = useCallback((text: string, id: number) => {
+    stopSpeaking();
+    setSpeakingId(id);
+    setVoiceState('speaking');
+    speak(text, {
+      onEnd: () => { setSpeakingId(null); setVoiceState('idle'); },
+      onError: (msg) => { setSpeakingId(null); setVoiceState('idle'); setMicError(msg); },
+    });
+  }, []);
+
+  const stopSpeakingNow = useCallback(() => {
+    stopSpeaking();
+    setSpeakingId(null);
+    setVoiceState('idle');
+  }, []);
 
   // ─── Translation retry ────────────────────────────────────────────────────────
 
@@ -378,6 +437,8 @@ export default function TheGarden({ onSave }: Props) {
       if (!reply.chinese && reply.english) {
         retryTranslation(aiId, reply.english);
       }
+
+      speakMessage(reply.english, aiId);
     } catch (err) {
       const raw = (err as Error).message ?? 'Unknown error';
       const friendly = raw === 'NO_KEY'
@@ -392,7 +453,7 @@ export default function TheGarden({ onSave }: Props) {
     }
   };
 
-  const handleSend = () => { sendMessage(inputText); };
+  const handleSend = () => { unlockAudio(); sendMessage(inputText); };
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   };
@@ -412,10 +473,12 @@ export default function TheGarden({ onSave }: Props) {
 
   const orbLabel = isThinking
     ? 'Thinking…'
+    : voiceState === 'speaking'
+    ? 'Speaking…'
     : 'Type below to begin';
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" onClick={unlockAudio}>
 
       {/* ── Scrollable content ── */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto custom-scrollbar">
@@ -470,6 +533,24 @@ export default function TheGarden({ onSave }: Props) {
         {/* No key banner */}
         {!hasKey && <NoKeyBanner />}
 
+        {/* Error toast for TTS failures */}
+        <AnimatePresence>
+          {micError && (
+            <motion.div
+              className="mx-4 mb-3 px-3 py-3 rounded-xl flex items-start gap-2.5 cursor-pointer"
+              style={{ background: 'rgba(180,40,40,0.16)', border: '1px solid rgba(220,80,80,0.22)' }}
+              initial={{ opacity: 0, y: 6, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -4, scale: 0.97 }}
+              transition={{ duration: 0.25 }}
+              onClick={() => setMicError(null)}
+            >
+              <AlertCircle size={14} className="text-red-400/70 flex-shrink-0 mt-0.5" />
+              <p className="text-[11.5px] font-light text-red-200/65 leading-relaxed">{micError}</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Chat messages */}
         <div className="px-4 space-y-3 pb-40">
           {messages.length === 0 && (
@@ -488,6 +569,9 @@ export default function TheGarden({ onSave }: Props) {
                 <AIBubble
                   key={msg.id}
                   msg={msg}
+                  isSpeaking={speakingId === msg.id}
+                  onSpeak={(text) => speakMessage(text, msg.id)}
+                  onStop={stopSpeakingNow}
                   onRetryTranslation={() => retryTranslation(msg.id, msg.english ?? '')}
                 />
               )
