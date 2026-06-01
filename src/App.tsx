@@ -5,7 +5,7 @@ import TheGarden from './views/TheGarden';
 import Memory from './views/Memory';
 import SettingsModal from './components/SettingsModal';
 import { loadMemories, saveMemory, deleteMemory, type MemoryRecord, type Message } from './lib/storage';
-import { getBgmVolume, setBgmEnabled, setupBgmPipeline, resumeAudioContext } from './lib/bgm';
+import { getBgmVolume, setBgmEnabled } from './lib/bgm';
 
 const BGM_URL = 'https://vewuxryfkugfffjfhhuk.supabase.co/storage/v1/object/public/assets/124803335-1-208.mp3';
 
@@ -40,18 +40,13 @@ export default function App() {
     el.volume = getBgmVolume();
   }, [settingsOpen]);
 
-  // Expose bgm element globally so TTS can duck it.
-  // Pipeline (MediaElement → GainNode) is set up lazily on first user tap
-  // because iOS requires the AudioContext to be "running" when
-  // createMediaElementSource() is called.
+  // Expose bgm element globally so TTS can duck it
   useEffect(() => {
     const el = bgmRef.current;
-    if (el) {
-      (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl = el;
-    }
+    if (el) (window as Window & { __bgmEl?: HTMLAudioElement }).__bgmEl = el;
   }, []);
 
-  const toggleBgm = async () => {
+  const toggleBgm = () => {
     const el = bgmRef.current;
     if (!el) return;
     if (bgmPlaying) {
@@ -59,11 +54,7 @@ export default function App() {
       setBgmPlaying(false);
       setBgmEnabled(false);
     } else {
-      // 1) Resume AudioContext (requires user gesture on iOS)
-      await resumeAudioContext();
-      // 2) Now that context is running, wire BGM through GainNode
-      setupBgmPipeline(el);
-      // 3) Start playback — audio routes through the GainNode pipeline
+      el.volume = getBgmVolume();
       el.play().catch(() => {});
       setBgmPlaying(true);
       setBgmEnabled(true);
@@ -73,7 +64,7 @@ export default function App() {
   return (
     <div className="min-h-[100dvh] bg-[#080a0f] flex items-stretch justify-center">
       {/* BGM — loop, low volume, off by default to respect autoplay policy */}
-      <audio ref={bgmRef} src={BGM_URL} loop preload="none" crossOrigin="anonymous" style={{ display: 'none' }} onEnded={() => setBgmPlaying(false)} />
+      <audio ref={bgmRef} src={BGM_URL} loop preload="none" style={{ display: 'none' }} onEnded={() => setBgmPlaying(false)} />
       <div
         className="relative flex flex-col w-full md:max-w-md md:border-x md:border-white/[0.07] overflow-hidden"
         style={{

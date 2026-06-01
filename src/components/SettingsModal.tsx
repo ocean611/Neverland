@@ -4,9 +4,9 @@ import { X, KeyRound, Eye, EyeOff, Check, ExternalLink, Cpu, Sparkles, Music2, V
 import {
   getProvider, setProvider, getApiKey, setApiKey,
   getCompanion, setCompanion,
-  getOpenAIKey, setOpenAIKey, getOpenAIBaseUrl, setOpenAIBaseUrl,
   type Provider, type Companion,
 } from '../lib/ai';
+import { getOpenAIKey, setOpenAIKey, getOpenAIBaseUrl, setOpenAIBaseUrl } from '../lib/speech';
 import { getBgmVolume, setBgmVolume } from '../lib/bgm';
 
 interface Props {
@@ -350,7 +350,7 @@ export default function SettingsModal({ open, onClose }: Props) {
                 </div>
 
                 <p className="text-[11px] font-light mt-2 leading-relaxed" style={{ color: 'rgba(255,255,255,0.18)' }}>
-                  BGM fades to {Math.round(bgmVolume * 15)}% while the AI speaks, then restores.
+                  BGM fades to {Math.round(bgmVolume * 22)}% while the AI speaks, then restores.
                 </p>
               </div>
 
